@@ -195,17 +195,146 @@ def cmd_verify(argv: Sequence[str]) -> int:
     return 1
 
 
+def cmd_eval(argv: Sequence[str]) -> int:
+    """Score the gateway against the labelled corpus."""
+    import json
+
+    from airlock.eval.harness import load_corpus, replay, validate_corpus
+    from airlock.eval.report import render
+    from airlock.inspect.structural import StructuralInspector
+
+    parser = argparse.ArgumentParser(
+        prog="airlock eval", description="Evaluate the gateway against the corpus."
+    )
+    parser.add_argument("--corpus", type=Path, default=Path("corpus"), help="corpus directory")
+    parser.add_argument(
+        "--split",
+        choices=("dev", "test", "all"),
+        default="all",
+        help="score only one partition (default: all)",
+    )
+    parser.add_argument("--json", type=Path, default=None, help="also write results as JSON")
+    parser.add_argument(
+        "--ablation",
+        action="store_true",
+        help="run the no-detector baseline alongside the full configuration",
+    )
+    args = parser.parse_args(list(argv))
+
+    if not args.corpus.exists():
+        print(f"error: no such corpus: {args.corpus}", file=sys.stderr)
+        return 2
+
+    cases = load_corpus(args.corpus)
+    if not cases:
+        print(f"error: no cases found under {args.corpus}", file=sys.stderr)
+        return 2
+
+    problems = validate_corpus(cases)
+    if problems:
+        print("error: the corpus is malformed:", file=sys.stderr)
+        for problem in problems:
+            print(f"  - {problem}", file=sys.stderr)
+        return 2
+
+    split = None if args.split == "all" else args.split
+    inspectors = [StructuralInspector()]
+    report = replay(cases, inspectors, split=split)
+
+    if args.ablation:
+        from rich.console import Console
+        from rich.table import Table
+
+        baseline = replay(cases, [], split=split)
+        console = Console()
+        table = Table(title="ablation: what each layer contributes")
+        table.add_column("configuration", no_wrap=True)
+        table.add_column("ASR", justify="right", no_wrap=True)
+        table.add_column("detect", justify="right", no_wrap=True)
+        table.add_column("FPR", justify="right", no_wrap=True)
+        table.add_column("note", overflow="fold")
+        table.add_row(
+            "no detectors",
+            f"{baseline.attack_success_rate() * 100:.1f}%",
+            f"{baseline.detection_rate() * 100:.1f}%",
+            f"{baseline.false_positive_rate() * 100:.1f}%",
+            "the undefended baseline this project has to beat",
+        )
+        table.add_row(
+            "structural",
+            f"{report.attack_success_rate() * 100:.1f}%",
+            f"{report.detection_rate() * 100:.1f}%",
+            f"{report.false_positive_rate() * 100:.1f}%",
+            "Unicode and template-token carriers only",
+        )
+        console.print(table)
+        console.print(
+            "[dim]provenance, semantic and policy layers are not implemented yet; "
+            "their steps are reported as coverage debt.[/dim]\n"
+        )
+
+    print(render(report, title=f"airlock evaluation ({args.split} split)"))
+
+    if args.json:
+        payload = {
+            "split": args.split,
+            "steps": len(report.results),
+            "attack_success_rate": report.attack_success_rate(),
+            "weighted_attack_success_rate": report.weighted_attack_success_rate(),
+            "detection_rate": report.detection_rate(),
+            "false_positive_rate": report.false_positive_rate(),
+            "gap_rate": report.gap_rate(),
+            "clean": report.is_clean(),
+            "latency_ns": report.latency(),
+            "failures": [
+                {
+                    "case": r.case_id,
+                    "step": r.index,
+                    "family": r.family,
+                    "expected": r.expected.verdict,
+                    "actual": r.actual,
+                    "outcome": r.outcome,
+                    "rules": list(r.rules),
+                }
+                for r in report.results
+                if r.outcome in ("false-positive", "mismatch")
+            ],
+            "per_family": {
+                family: {
+                    "steps": len(results),
+                    "stopped": sum(
+                        r.actual in ("block", "modify")
+                        and not (r.expected.layer and r.expected.layer != "structural")
+                        for r in results
+                    ),
+                    "gaps": sum(
+                        r.expected.layer is not None and r.expected.layer != "structural"
+                        for r in results
+                    ),
+                }
+                for family, results in sorted(report.by_family().items())
+            },
+        }
+        args.json.parent.mkdir(parents=True, exist_ok=True)
+        args.json.write_text(json.dumps(payload, indent=2) + "\n")
+        print(f"\nwrote {args.json}")
+
+    return 0 if report.is_clean() else 1
+
+
 USAGE = f"""airlock {__version__} - runtime provenance enforcement for MCP
 
 usage:
   airlock proxy  [options] -- <command> [args...]   interpose on a stdio MCP server
   airlock replay <audit.jsonl>                      inspect a recorded session
-  airlock verify <audit.jsonl>                      check the audit chain
+  airlock verify <audit.jsonl>                      check the hash chain
+  airlock eval   [options]                          score against the corpus
 
 examples:
   airlock proxy -- npx -y @modelcontextprotocol/server-filesystem /tmp
   airlock replay .airlock/audit.jsonl --decisions block,flag
   airlock verify .airlock/audit.jsonl
+  airlock eval --split test --ablation --json results/eval.json
 
 run 'airlock <command> --help' for command options.
 """
@@ -225,6 +354,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "proxy": cmd_proxy,
         "replay": cmd_replay,
         "verify": cmd_verify,
+        "eval": cmd_eval,
     }
     handler = handlers.get(command)
     if handler is None:

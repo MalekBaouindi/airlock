@@ -6,10 +6,11 @@ Airlock interposes on MCP traffic between an agent host and its tool servers, tr
 where untrusted content flows, and refuses to let it reach an egress sink — then tries
 to defeat itself and publishes the results.
 
-> **Status: early.** The interposition relay, audit chain, and first detector are
-> implemented. The provenance engine, policy engine, local-LLM detector, and the
-> evaluation harness are in progress. The results table below is filled in by
-> `make eval`; it is intentionally empty rather than illustrative.
+> **Status: early, and the numbers are small.** The interposition relay, the audit
+> chain, the structural detector, and the evaluation harness are implemented. The
+> provenance engine, policy engine, and local-LLM detector are not. The measured
+> attack success rate below is **87.5%** — the harness is honest about the fact that
+> one of the four layers it grades is shipping and three are not yet written.
 
 ## Why
 
@@ -119,9 +120,48 @@ admitted.
 | `sleeper_channel` | arXiv:2605.13471 | intake and effect decoupled in time |
 | `policy_generality` | arXiv:2608.27092 | naming the goal does not generalise |
 
+### Grading a partial build without inflating its numbers
+
+Two things are graded independently for every step: `expect.verdict`, what a complete
+system should do, and `expect.layer`, which component of *this* system is accountable
+for it. A step this build cannot handle is reported as a **gap**, not a regression — but
+it still counts fully toward attack success rate. Nothing is written off.
+
+The line that stays hard: a step attributed to a layer that exists must match its corpus
+verdict, and any non-`allow` result on an `allow` step is a false positive. Both fail the
+run regardless of what is under construction.
+
 ### Results
 
-_Not yet measured. `make eval` writes this table._
+Held-out `test` split, measured by `make eval`. `dev` is for iteration; the splits are
+disjoint and each contains steps the shipped layer owns.
+
+| metric | value | 95% CI (bootstrap over cases) |
+|---|---|---|
+| attack success rate | 87.5% | [57.1%, 100.0%] |
+| weighted ASR | 81.0% | – |
+| detection rate | 12.5% | [0.0%, 42.9%] |
+| false positive rate | 0.0% | 0/33 expected-allow steps |
+| control noise floor | 1 step | `benign-template-docs`, `template-token` |
+
+16 cases, 47 steps, 8 expected-harm. Structural layer: **1/1 owned step stopped**
+(invisible Unicode tag characters), 0 false positives, p50 8.3µs / p95 35.1µs
+inspection cost per step.
+
+Read this honestly: **87.5% attack success is the real number.** The remaining seven
+misses are attributed to layers that do not exist yet — 6 to provenance (denial
+feedback, reframed instructions, sharded secrets, sleeper channels) and 1 to policy.
+The 12.5% detection rate is over a corpus deliberately built from attacks a lexical
+filter cannot see, and is not comparable to a vendor's headline figure.
+
+The control noise floor is tracked separately from the false-positive rate so a 0.0% FPR
+cannot be misread as "the detector was quiet everywhere". One step is flagged on
+purpose: a documentation page that literally contains chat-template tokens. Flagging it
+is correct — an analyst should see it. Blocking it would make documentation about chat
+templates unreadable, and the corpus grades the severity, not the silence.
+
+The corpus is small and hand-built, so the intervals are wide and the point estimates
+should be read as a working measurement, not a benchmark.
 
 ## Layout
 

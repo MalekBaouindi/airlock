@@ -183,6 +183,26 @@ def _excerpt(text: str, index: int, width: int = 24) -> str:
     return escaped
 
 
+def _is_documentation_quoting(text: str, start: int) -> bool:
+    """Is this token being *quoted* rather than *used*?
+
+    A token at the start of a line, or one preceded by a fence, a bullet, or a
+    backtick, is someone showing you the syntax. A token with ordinary prose
+    running into it on both sides is someone trying to become the control
+    channel.
+
+    The distinction is positional rather than semantic, so it costs nothing and
+    cannot be talked around by rewording: an attacker who wants the check to
+    fire simply has to not put the token at a line start.
+    """
+    line_start = text.rfind("\n", 0, start) + 1
+    before = text[line_start:start]
+    if not before.strip():
+        return True  # first thing on the line
+    stripped = before.rstrip()
+    return stripped.endswith(("`", "*", "-", "|", ">", ":", "```"))
+
+
 def scan_text(text: str, path: str) -> list[RuleHit]:
     """Apply every structural rule to one string."""
     if not text:
@@ -266,6 +286,12 @@ def scan_text(text: str, path: str) -> list[RuleHit]:
         )
 
     for match in _TEMPLATE_TOKENS.finditer(text):
+        if _is_documentation_quoting(text, match.start()):
+            # Documentation *about* chat templates necessarily contains the
+            # tokens. What distinguishes an attack is a token embedded in
+            # running prose -- positioned so it will be read as a control
+            # channel rather than quoted as an example.
+            continue
         hits.append(
             RuleHit(
                 rule="template-token",
