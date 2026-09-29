@@ -1,0 +1,70 @@
+[project]
+name = "airlock"
+version = "0.0.1"
+description = "Runtime provenance enforcement and adversarial evaluation for the Model Context Protocol"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "Apache-2.0" }
+
+# The relay core is deliberately near-dependency-free. A security gateway that
+# you interpose into your agent traffic should not drag in a large transitive
+# tree, and it must not depend on the MCP SDK to inspect MCP traffic -- doing so
+# would couple our parser to one revision of the protocol.
+dependencies = [
+    "pyyaml>=6.0",
+    "rich>=13.0",
+]
+
+[project.optional-dependencies]
+# Real MCP clients/servers, used only by the integration suite and the eval
+# harness. Pinned below v2 until the SDK's 2026-07-28 revision is verified
+# against our relay.
+integration = [
+    "mcp>=1.27,<2",
+]
+local-llm = [
+    "llama-cpp-python>=0.3",
+    "huggingface-hub>=0.24",
+]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+    "ruff>=0.6",
+    "mypy>=1.11",
+    "types-PyYAML",
+]
+
+[project.scripts]
+airlock = "airlock.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/airlock"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF", "PTH"]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+files = ["src"]
+warn_unreachable = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+addopts = "-q"
+
+[dependency-groups]
+dev = [
+    "pytest-cov>=7.1.0",
+]

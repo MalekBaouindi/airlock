@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# uv
+.uv/
+
+# NOTE: uv.lock is intentionally committed. Reproducibility is the point of
+# this project; a floating dependency resolution undermines every measurement
+# in the evaluation.
+
+# Tooling
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# airlock runtime artifacts
+.airlock/
+*.jsonl
+!corpus/**/*.jsonl
+results/
+
+# Models
+models/
+*.gguf
+
+# macOS
+.DS_Store
