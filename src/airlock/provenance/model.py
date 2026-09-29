@@ -62,11 +62,41 @@ SENSITIVE_PATH = re.compile(
     | (?:^|/)secrets?/
     | (?:^|/)\.env(?:\.[a-z]+)?$
     | \.(?:pem|p12|pfx|keystore|jks)$
-    | credentials(?:\.[a-z]+)?$
+    # The leading `(?:^|/)` matters: without it this also matches the tail of
+    # `SELECT id FROM credentials`, where "credentials" is a table name and not
+    # a path. A space is not a path separator, and treating it as one makes
+    # every column read on such a table look like a secret read.
+    | (?:^|/)credentials(?:\.[a-z]+)?$
     | (?:^|/)secrets?\.(?:json|ya?ml|toml)$
     """,
     re.VERBOSE | re.IGNORECASE,
 )
+
+#: Identifiers naming a store of secrets, in a *structured* query rather than
+#: a path. A `SELECT token FROM credentials` is as much a secret read as
+#: `read /run/secrets/api_token`, and the path regex above cannot see it: there
+#: is no path in the argument, only a table name. Without this, a credential
+#: exfiltrated out of a database is invisible -- the read looks ordinary and the
+#: value arrives at the sink with nothing to match against.
+#:
+#: This is deliberately a *naming* heuristic, and a weak one. A database holding
+#: credentials in a table called `tokens_v2` evades it, and a benign query
+#: against a table called `credentials` trips it. The false-positive cost is
+#: bounded -- the worst outcome is a block on a legitimate query, which an
+#: operator can see and allow -- while the miss is a silent leak. It is recorded
+#: here as a heuristic rather than presented as coverage.
+SENSITIVE_IDENTIFIER = re.compile(
+    r"""
+      \b(?:credentials?|secrets?|api[_-]?keys?|tokens?|passwords?)\b
+    | \bprivate[_-]?key\b
+    | \baccess[_-]?key\b
+    """,
+    re.VERBOSE | re.IGNORECASE,
+)
+
+#: Argument names whose values are queries or expressions rather than paths.
+#: Checked separately because a path-shaped regex over a SQL string is noise.
+QUERY_ARGUMENTS: Final = ("sql", "query", "statement", "expr", "filter", "where")
 
 #: Hostnames that cannot be registered by an outside party. `.internal` and
 #: `.local` are reserved and absent from the public root zone, and RFC1918
@@ -169,8 +199,10 @@ class TaintSource:
     text: str = ""
     #: Candidate secret tokens, used to recognise a sharded reconstruction.
     atoms: frozenset[str] = frozenset()
-    #: Hostnames the content named. Used by the destination rule.
-    hosts: frozenset[str] = frozenset()
+    #: Hostnames the content named. Used by the destination rule. Mutable
+    #: because a host the agent had already chosen can be withdrawn when a
+    #: result turns out to echo it back; see `TaintStore.forget_untrusted_hosts`.
+    hosts: set[str] = field(default_factory=set)
 
 
 @dataclass(frozen=True, slots=True)
@@ -213,7 +245,7 @@ class TaintStore:
                 label=label,
                 text=text[:MAX_SOURCE_CHARS] if sensitive else "",
                 atoms=frozenset(atoms_of(text)) if sensitive else frozenset(),
-                hosts=frozenset(hosts_in(text)),
+                hosts=set(hosts_in(text)),
             )
         )
 
@@ -230,7 +262,7 @@ class TaintStore:
                 label=label,
                 text=text[:MAX_SOURCE_CHARS],
                 atoms=frozenset(atoms_of(text)),
-                hosts=frozenset(hosts_in(text)),
+                hosts=set(hosts_in(text)),
             )
         )
 
@@ -254,6 +286,28 @@ class TaintStore:
             for host in source.hosts:
                 hosts.setdefault(host, source)
         return hosts
+
+    def forget_untrusted_hosts(self, owned: str) -> None:
+        """Stop blaming a host that a result merely echoed back.
+
+        `owned` is the destination the agent itself supplied in the request. A
+        server that reports what it did -- "200 OK https://api.example.net/x" --
+        puts that host into the agent's context, and the naive reading treats
+        the context as the place the host came from. But the agent typed the
+        host into the request; it did not learn it here. Marking it untrusted
+        makes the second ordinary call to that API a block, which is the most
+        common request pattern there is.
+
+        Only the host already attributed to a source that named it is touched,
+        so a result which echoes the requested URL *and* links somewhere else
+        still taints the other destination.
+        """
+        if not owned:
+            return
+        needle = owned.lower()
+        for source in self.sources:
+            if needle in source.hosts:
+                source.hosts.discard(needle)
 
     def record_outbound(self, payload: str) -> str:
         """Append to the reconstructed outbound stream and return it."""

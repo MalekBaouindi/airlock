@@ -38,6 +38,8 @@ from airlock.gateway.jsonrpc import Message
 from airlock.gateway.session import SessionContext
 from airlock.inspect.base import Verdict
 from airlock.provenance.model import (
+    QUERY_ARGUMENTS,
+    SENSITIVE_IDENTIFIER,
     SENSITIVE_PATH,
     EgressMatch,
     TaintStore,
@@ -118,6 +120,9 @@ class ProvenanceInspector:
         #: The request currently awaiting a response, so a result knows what it
         #: is a result *of* and which request it answers.
         self._inflight: dict[str, tuple[str, bool]] = {}
+        #: Host each in-flight request asked to reach, so its response can be
+        #: recognised as an echo rather than a source.
+        self._egress_targets: dict[str, str] = {}
 
     @property
     def store(self) -> TaintStore:
@@ -126,6 +131,7 @@ class ProvenanceInspector:
     def reset(self) -> None:
         self._store = TaintStore()
         self._inflight.clear()
+        self._egress_targets.clear()
 
     # -- request leg --------------------------------------------------------
 
@@ -146,7 +152,20 @@ class ProvenanceInspector:
             return Verdict.allow()
 
         self._inflight[key] = (name, is_sensitive_request(name, arguments))
-        return self._check_sink(name, arguments)
+        verdict = self._check_sink(name, arguments)
+        if verdict.action == "block":
+            # The proxy answers a blocked request itself and never forwards it,
+            # so no response is coming to match this id against. Keeping the
+            # entry would do more than leak a dict key: JSON-RPC ids are
+            # reusable, and a later response carrying the same id would be
+            # attributed to *this* request -- the wrong tool, the wrong
+            # sensitivity, the wrong destination.
+            self._inflight.pop(key, None)
+            return verdict
+        # Remember what the agent asked *for*, so the response leg can tell an
+        # echo of its own request apart from a host it learned elsewhere.
+        self._egress_targets[key] = _host_of(_destination_of(arguments))
+        return verdict
 
     # -- response leg -------------------------------------------------------
 
@@ -154,15 +173,18 @@ class ProvenanceInspector:
         if ctx.inbound_method != "tools/call":
             return Verdict.allow()
         tool, sensitive = self._inflight.pop(str(message.id), ("", False))
+        destination = self._egress_targets.pop(str(message.id), "")
         if not tool:
             return Verdict.allow()
         if message.is_error:
             return self._record_denial(tool, message)
-        return self._record_result(tool, message, sensitive)
+        return self._record_result(tool, message, sensitive, destination)
 
     # -- sources ------------------------------------------------------------
 
-    def _record_result(self, tool: str, message: Message, sensitive: bool) -> Verdict:
+    def _record_result(
+        self, tool: str, message: Message, sensitive: bool, destination: str = ""
+    ) -> Verdict:
         result = message.result if isinstance(message.result, dict) else {}
         text = "\n".join(strings_in(result))
         if not text:
@@ -171,6 +193,16 @@ class ProvenanceInspector:
         # redacted or empty result is still a result about a secret, and the
         # atoms have to exist for the fragment rule to have anything to match.
         self._store.note_read(f"{tool}()", text, sensitive=sensitive)
+        # A result that echoes back the destination the agent itself supplied is
+        # not the agent learning a host from untrusted content -- it already
+        # had that host, it typed it into the request. Servers that report what
+        # they did are extremely common ("200 OK https://..."), and treating the
+        # echo as a new source marks the agent's own destination as untrusted,
+        # so the second request to a host the agent chose normally gets blocked.
+        # That is a false positive on the single most ordinary operation there
+        # is: calling the same API twice.
+        if destination:
+            self._store.forget_untrusted_hosts(destination)
         self._note_pointers(text)
         return Verdict.allow()
 
@@ -251,12 +283,27 @@ class ProvenanceInspector:
 
 
 def is_sensitive_request(name: str, arguments: dict[str, Any]) -> bool:
-    """Does this call ask for a secret store?"""
-    if not re.search(r"(?i)(read|get|fetch|cat|open|stat|ls|list|download)", name):
+    """Does this call ask for a secret store?
+
+    Two shapes, because tools name things differently. A path-shaped argument
+    matches `SENSITIVE_PATH`. A query-shaped argument matches
+    `SENSITIVE_IDENTIFIER`, which is how a credential read from a database
+    column is recognised: there is no path in the argument at all, only a table
+    name, so a path regex returns nothing and the leak is silent.
+    """
+    if not re.search(r"(?i)(read|get|fetch|cat|open|stat|ls|list|download|select|query)", name):
         return False
-    return any(
-        isinstance(value, str) and SENSITIVE_PATH.search(value) for value in arguments.values()
-    )
+    for key, value in arguments.items():
+        if not isinstance(value, str):
+            continue
+        if SENSITIVE_PATH.search(value):
+            return True
+        # A query is judged by the identifiers it names, not by the whole
+        # string: `SELECT id FROM sessions` mentions no secret store and must
+        # not be treated as one.
+        if key in QUERY_ARGUMENTS and SENSITIVE_IDENTIFIER.search(value):
+            return True
+    return False
 
 
 __all__ = ["ProvenanceInspector", "is_sensitive_request"]

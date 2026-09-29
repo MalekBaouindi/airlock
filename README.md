@@ -7,11 +7,12 @@ where untrusted content flows, and refuses to let it reach an egress sink — th
 to defeat itself and publishes the results.
 
 > **Status: early, and the numbers are small.** The interposition relay, the audit
-> chain, the structural detector, the provenance engine, and the evaluation harness
-> are implemented. The policy engine and the local-LLM detector are not. Held-out
-> attack success rate is **12.5%** at 0% false positives, with 6 of 6 owned steps
-> stopped — the residual is two `policy` steps, and the harness names them rather
-> than folding them into a rounder figure.
+> chain, the structural detector, the provenance engine, the evaluation harness,
+> and the integration suite against real MCP servers are implemented. The policy
+> engine and the local-LLM detector are not. Held-out attack success rate is
+> **12.5%** at 0% false positives, with 6 of 6 owned steps stopped — the residual
+> is two `policy` steps, and the harness names them rather than folding them into a
+> rounder figure.
 
 ## Why
 
@@ -64,6 +65,33 @@ uv sync --extra dev          # core + tests
 uv sync --extra dev --extra integration   # + real MCP SDK, for the integration suite
 ```
 
+The MCP SDK is an optional extra. The core and the evaluation harness depend on
+nothing outside the standard library, which is deliberate: the thing being measured
+should not drag a dependency tree into the measurement.
+
+## Testing against real servers
+
+`make integration` runs the gateway against four real MCP servers — filesystem, Git,
+fetch, and SQLite — through the real SDK client, with a real secret on disk, a real
+`git log`, and a real database file. `make test` runs the whole suite, skipping these
+when the extra is absent.
+
+The fixtures are real where being real is the point and stubbed only where it is not.
+Filesystem, Git, and SQLite do the actual work. The fetch server does not open a
+socket: it records the request and returns a response, because a test that fails
+because a network was busy has taught nobody anything. What is being tested is the
+argument shape and the destination, neither of which needs a network to be meaningful.
+
+Two details of the real protocol turned out to matter:
+
+- **A stateful server refuses `tools/call` before `initialize` completes.** The relay
+  forwards the handshake, so this works — but a gateway that let a call through without
+  one would be forwarding traffic no real client can produce.
+- **The real SDK client does not pipeline.** A host that offers all 25 requests before
+  reading a single reply is not a shape any client has, so the audit test drives the
+  relay one turn at a time. Piped input would measure the fixture rather than the
+  gateway.
+
 ## Usage
 
 ```bash
@@ -110,6 +138,22 @@ would break the agent while hiding the event.
 **Detectors observe, policy decides.** Detectors report findings and severities; whether a
 finding is fatal depends on where the tainted content is flowing. This separation is what
 makes the layer-by-layer ablation meaningful.
+
+**A server echoing a URL you gave it is not a source.** The provenance layer treats any
+content entering the context as potentially hostile, which is right in general and badly
+wrong for one very common shape: servers that report what they just did (`200 OK
+https://api.example.net/v1/status`). The agent typed that host into the request; it did
+not learn it from the response. Attributing it to the response anyway makes the *second*
+ordinary call to any API a block, so the destination rule withdraws exactly the host the
+agent supplied and leaves every other host in the same result tainted. This was not found
+by reading the corpus. It was found by pointing the gateway at real MCP servers and
+discovering that a session of eleven legitimate calls blocked three of them.
+
+**A credential column is a secret read.** A path regex sees nothing in
+`SELECT token FROM credentials` — there is no path in the argument, only a table name — so
+queries are judged separately, by the identifiers they name. A false positive there only
+records a source, while a false negative is a silent leak, so the threshold leans towards
+treating a query as sensitive.
 
 **The audit log is tamper-evident.** Records are hash-chained; deleting, editing or
 reordering any record invalidates every record after it. Payload capture defaults to

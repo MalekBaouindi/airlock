@@ -1,4 +1,4 @@
-.PHONY: help sync lint format typecheck test coverage corpus verify eval ablation smoke all clean
+.PHONY: help sync lint format typecheck test integration coverage corpus verify eval ablation smoke all clean
 
 PY := .venv/bin/python
 AIRLOCK := .venv/bin/airlock
@@ -22,6 +22,10 @@ typecheck:  ## Static types (strict)
 
 test:  ## Run the test suite
 	.venv/bin/pytest -q
+
+integration:  ## Run the suite against real MCP servers (needs the integration extra)
+	uv pip install --python $(PY) -e '.[integration]'
+	.venv/bin/pytest tests/test_integration_real_mcp.py -q
 
 coverage:  ## Test suite with coverage report
 	.venv/bin/pytest -q --cov=airlock --cov-report=term-missing
