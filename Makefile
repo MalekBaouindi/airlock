@@ -1,4 +1,4 @@
-.PHONY: help sync model judge judge-stop lint format typecheck test integration coverage corpus verify eval eval-dev eval-semantic ablation smoke all clean
+.PHONY: help sync model judge judge-stop lint format typecheck test integration coverage corpus verify eval eval-dev eval-semantic ablation policy-check smoke all clean
 
 PY := .venv/bin/python
 AIRLOCK := .venv/bin/airlock
@@ -84,7 +84,10 @@ ablation:  ## Run each layer alone, to see which one earns its place
 smoke:  ## End-to-end check through the installed CLI
 	$(PY) scripts/smoke.py
 
-all: lint typecheck test  ## Everything CI runs
+policy-check:  ## Is the policy file still deciding every destination the traffic uses?
+	$(AIRLOCK) policy-check --policy $(POLICY)
+
+all: lint typecheck test policy-check  ## Everything CI runs
 
 clean:  ## Remove caches and local artifacts
 	rm -rf .pytest_cache .mypy_cache .ruff_cache htmlcov .coverage results

@@ -87,6 +87,43 @@ class PolicyError(ValueError):
     """
 
 
+#: Argument names whose value names who receives the data. This is the set of
+#: fields a policy file is expected to have an opinion about, and it is wider
+#: than provenance's ``DESTINATION_ARGUMENTS`` on purpose.
+#:
+#: Provenance needs a narrower list, because it extracts a *host* to reason about
+#: sharding and trust, and only a URL or an address yields one. A policy asks a
+#: different question -- who is this addressed to -- and the corpus's
+#: `create_calendar_event` step is addressed to a list of `attendees`, which has
+#: no host to extract. Reading the narrower list here would make the
+#: policy-check command blind to the exact surface the policy layer exists to
+#: close, which is a way of shipping a check that cannot fail on the bug it was
+#: written for.
+#:
+#: Content-shaped fields are absent, and their absence is the design: `body`,
+#: `description`, `subject` and the rest carry the payload, and whether that
+#: payload is secret is provenance's question. A policy file that also answered
+#: it would grow a second copy of the secret patterns, and the second copy would
+#: rot. The corpus pairs the two layers exactly this way: the calendar invite
+#: rides its description along to the attendees, so constraining *who is invited*
+#: covers the field without ever naming it.
+RECIPIENT_ARGUMENTS = frozenset(
+    {
+        "attendees",
+        "bcc",
+        "cc",
+        "channel",
+        "destination",
+        "endpoint",
+        "recipients",
+        "to",
+        "uri",
+        "url",
+        "webhook",
+    }
+)
+
+
 def normalise(value: str) -> str:
     """Reduce a destination to the thing a policy is allowed to name.
 
@@ -326,6 +363,7 @@ class PolicyInspector:
 
 __all__ = [
     "ANY_TOOL",
+    "RECIPIENT_ARGUMENTS",
     "RULE",
     "Policy",
     "PolicyError",

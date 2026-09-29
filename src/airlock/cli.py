@@ -297,6 +297,142 @@ def cmd_replay(argv: Sequence[str]) -> int:
     return 0
 
 
+def cmd_policy_check(argv: Sequence[str]) -> int:
+    """Report the destination fields a policy file leaves undecided.
+
+    The evaluation shows what a stale file costs on the corpus it has. This asks
+    the question that generalises past it: of the fields the traffic actually
+    uses, which ones does the file say nothing about. Exits non-zero when any are
+    left, so a policy file cannot rot quietly in CI -- the failure mode of a
+    configuration file is that deleting a line makes the gateway quieter, and
+    nothing else in the system would say so.
+    """
+    parser = argparse.ArgumentParser(
+        prog="airlock policy-check",
+        description="Report destination fields the policy file does not decide.",
+    )
+    parser.add_argument(
+        "--policy",
+        default=None,
+        help="policy file (default: $AIRLOCK_POLICY)",
+    )
+    parser.add_argument(
+        "--split",
+        default=None,
+        choices=("dev", "test"),
+        help="restrict to one split (default: both)",
+    )
+    parser.add_argument(
+        "--all",
+        action="store_true",
+        help="show decided surfaces too, not only the undecided ones",
+    )
+    args = parser.parse_args(list(argv))
+
+    policy = _load_policy(str(args.policy) if args.policy else None)
+    if policy is None:
+        print(
+            "error: no policy file; pass --policy PATH or set AIRLOCK_POLICY\n"
+            "       there is nothing to check against, and a file that decides "
+            "nothing is the failure this command exists to report",
+            file=sys.stderr,
+        )
+        return 2
+
+    from airlock.eval.harness import load_corpus
+    from airlock.eval.policy_check import check_policy
+
+    corpus_root = Path(__file__).resolve().parents[2] / "corpus"
+    check = check_policy(policy, load_corpus(corpus_root), split=args.split)
+
+    from rich.console import Console
+    from rich.table import Table
+
+    console = Console()
+    width = console.width
+    compact = width < 100
+    shown = check.surfaces if args.all else list(check.gaps)
+    # An empty table is worse than no table: a header over zero rows reads like
+    # the tool found nothing at all, when it found three decided fields.
+    if shown:
+            # Long titles wrap onto three lines in a narrow terminal and push the table
+        # off the screen, so the split is named and the file is not.
+        title = f"airlock policy-check - {args.split or 'dev+test'} split(s)"
+        table = Table(title=title, show_lines=False, expand=False)
+        table.add_column("", no_wrap=True)
+        table.add_column("surface", no_wrap=True)
+        table.add_column("calls", justify="right", no_wrap=True)
+        if not compact:
+            table.add_column("harm", justify="right", no_wrap=True)
+            table.add_column("destinations", overflow="fold", min_width=16)
+        if args.all:
+            table.add_column("note", overflow="fold", min_width=20)
+
+        shown = check.surfaces if args.all else list(check.gaps)
+        for surface in shown:
+            if surface.decision == "undecided":
+                # A block the corpus expects here and the file will not make is the
+                # whole point of the command, so it gets the only mark in the table.
+                mark, style = ("GAP", "bold red") if surface.expected_harm_undecided else ("gap", "red")
+            elif surface.decision == "anywhere":
+                mark, style = "open", "yellow"
+            else:
+                mark, style = "ok", "green"
+            row = [f"[{style}]{mark}[/{style}]", surface.surface, str(surface.calls)]
+            if not compact:
+                row.append(str(surface.harm_steps))
+                destinations = ", ".join(sorted(surface.destinations)[:3])
+                if len(surface.destinations) > 3:
+                    destinations += f", +{len(surface.destinations) - 3} more"
+                row.append(destinations)
+            if args.all:
+                row.append(surface.note or "-")
+            table.add_row(*row)
+
+        console.print(table)
+
+    gaps = check.gaps
+    urgent = [s for s in gaps if s.expected_harm_undecided]
+    if not args.all:
+        if not gaps:
+            console.print(
+                f"every destination field the traffic uses is decided by the file "
+                f"({len(check.loose)} of them deliberately open; --all to read the notes)"
+            )
+        console.print(
+            f"{check.cases} case(s), {check.calls} tool call(s) with a destination, "
+            f"{len(check.surfaces)} destination field(s) seen"
+        )
+        if gaps:
+            listed = ", ".join(s.surface for s in gaps)
+            console.print(
+                f"\n[bold red]{len(gaps)} field(s) the traffic uses and the file does not "
+                f"decide:[/] {listed}",
+                highlight=False,
+            )
+            for surface in urgent:
+                cases = ", ".join(sorted(surface.attack_cases)[:3])
+                console.print(
+                    f"  [bold red]{surface.surface}[/] carries "
+                    f"{surface.harm_steps} step(s) the corpus expects to be blocked "
+                    f"({cases}) -- the file permits every one of them",
+                    highlight=False,
+                )
+            console.print(
+                "\nthese are holes, not errors: add a rule, or `anywhere: true` with a "
+                "note saying why the deployment accepts them",
+                highlight=False,
+            )
+    console.print(
+        "scope: fields the engine recognises as carrying a destination, in this corpus. "
+        "a field it does not recognise is not counted here, and a surface the corpus "
+        "never exercises is not evidence that it is covered.",
+        style="dim",
+        highlight=False,
+    )
+    return 1 if gaps else 0
+
+
 def cmd_verify(argv: Sequence[str]) -> int:
     parser = argparse.ArgumentParser(
         prog="airlock verify", description="Verify the audit chain has not been altered."
@@ -551,12 +687,14 @@ usage:
   airlock replay <audit.jsonl>                      inspect a recorded session
   airlock verify <audit.jsonl>                      check the hash chain
   airlock eval   [options]                          score against the corpus
+  airlock policy-check [options]                    fields the policy file does not decide
 
 examples:
   airlock proxy -- npx -y @modelcontextprotocol/server-filesystem /tmp
   airlock replay .airlock/audit.jsonl --decisions block,flag
   airlock verify .airlock/audit.jsonl
   airlock eval --split test --ablation --json results/eval.json
+  airlock policy-check --policy examples/corpus-workspace-policy.json
 
 run 'airlock <command> --help' for command options.
 """
@@ -577,6 +715,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "replay": cmd_replay,
         "verify": cmd_verify,
         "eval": cmd_eval,
+        "policy-check": cmd_policy_check,
     }
     handler = handlers.get(command)
     if handler is None:

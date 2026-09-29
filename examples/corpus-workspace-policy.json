@@ -19,6 +19,12 @@
         "note": "Invitations stay inside the org. A calendar invite is a grant of access to a meeting, and the description field rides along with it, so an external attendee is a recipient the workspace never agreed to."
       }
     },
+    "web_fetch": {
+      "url": {
+        "anywhere": true,
+        "note": "A read is not egress, so this surface is open on purpose and the note exists to stop the next person 'fixing' it. A fetch brings the response into the transcript, where provenance judges it, and the harm in every delivery case in the corpus lands on a later step rather than here. An allowlist could not separate the two anyway: the attack transcripts fetch the same hosts the agent legitimately reads -- docs.example.com appears on both sides -- so any list narrow enough to be safe would break reading documentation, and '.example.com' would cover more than the deployment. Residual risk, stated rather than hidden: material pasted into a query string is sent outbound by this surface, and policy alone will not stop it; only provenance, if it has seen the material, will."
+      }
+    },
     "send_email": {
       "to": {
         "anywhere": true,

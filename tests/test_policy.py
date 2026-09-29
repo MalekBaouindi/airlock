@@ -321,6 +321,7 @@ class TestShippedConfiguration:
             "create_calendar_event",
             "http_post",
             "send_email",
+            "web_fetch",
         ]
         # Every surface carries a reason. A policy file with bare allowlists
         # cannot be reviewed six months later, and an unreviewable policy file

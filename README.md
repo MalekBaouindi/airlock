@@ -151,11 +151,25 @@ nobody decided anything about.
 
 **What it does not do.** It does not decide whether a value is sensitive — that is
 provenance, and duplicating it is how a policy file grows secret patterns that rot.
-It does not constrain what an agent may *read*: a fetch cannot exfiltrate what the
-agent already holds, and a policy that constrained fetches would break the ability to
-read documentation, which is how most attacks arrive. And it does not constrain
-email by default, because outbound mail is mediated by the workspace's own MTA and
-the interesting question about a message is its body.
+Payload fields (`body`, `description`, `subject`) are absent from the example file
+for the same reason: the corpus's calendar step rides its description along to
+attendees nobody invited, and constraining *who is invited* covers the field without
+ever naming it. And it does not refuse external mail, because outbound mail is
+mediated by the workspace's own MTA and the interesting question about a message is
+its body.
+
+**Reads are open, and that is a claim rather than an oversight.** `web_fetch.url` is
+`anywhere: true` in the example file. The reasoning is that a fetch brings the
+response *into* the transcript, where provenance judges it, and every delivery case
+in the corpus does its damage on a later step. An allowlist could not separate the
+two anyway: the attack transcripts fetch the same hosts the agent legitimately
+reads — `docs.example.com` appears on both sides — so a list narrow enough to be
+safe would break reading documentation.
+
+It is still not free, and the file says so: material pasted into a query string is
+sent *outbound* by that surface, and policy alone will not stop it. Only provenance
+will, and only if it has seen the material. That is the kind of limitation that
+belongs in the file rather than in a changelog, so it is in the note.
 
 ### What the policy file is worth, and what it costs
 
@@ -186,6 +200,38 @@ contains only destinations the benign traffic uses. And the wildcard
 `.collector.example.net` is a deliberate trade — it covers the sharded collector
 without listing twenty-five hostnames, and it would also cover
 `attacker.collector.example.net`.
+
+### Keeping the file honest
+
+A configuration file fails the way a program does not: deleting a line makes the
+gateway quieter, and every other signal in the system still says the file is fine.
+The evaluation catches the consequence on a split it happens to contain, which for
+`http_post.url` is `framing_sweep-002` and a 12.5% ASR — but only as long as someone
+runs it and reads the number. So the question is asked directly:
+
+```
+$ airlock policy-check --policy examples/corpus-workspace-policy.json
+every destination field the traffic uses is decided by the file (2 of them
+deliberately open; --all to read the notes)
+26 case(s), 48 tool call(s) with a destination, 4 destination field(s) seen
+```
+
+Delete `http_post.url` from that file and it exits 1, names the field, and says how
+many steps the corpus expects to be blocked through it. That is a CI step, and it is
+the only check in the project that can fail on a change to a file rather than to
+code.
+
+Two things it deliberately will not do. It does not run a detector — the question is
+about the file, so there is no model server, no state, and the same answer every
+time. And it does not rank by whether an attack case touched a field, because every
+delivery case in the corpus fetches a URL and is *supposed* to be allowed; it ranks
+by whether a block was expected there, which is a question about the file. The scope
+it cannot see is printed on every run: a field the engine does not recognise as a
+destination is not counted, and a surface the corpus never exercises is not evidence
+that it is covered.
+
+It found one real gap in the example file it shipped with, on the first run:
+`web_fetch.url`, which is now an explicit `anywhere` with the reasoning above.
 
 ## The local judge
 
@@ -278,6 +324,9 @@ airlock replay .airlock/audit.jsonl --decisions block,flag
 
 # confirm the audit trail has not been altered
 airlock verify .airlock/audit.jsonl
+
+# is the policy file still deciding what the traffic actually does?
+airlock policy-check --policy examples/corpus-workspace-policy.json
 ```
 
 ## Design notes
@@ -347,6 +396,16 @@ so a model having an off day cannot be read as an all-clear.
 — seconds, not microseconds. On stdio that serialises concurrent requests rather
 than corrupting them, and the ablation reports the cost in seconds for that
 reason. Making the interface async is the real fix and is not done here.
+
+**A check on a file has to ask the file's question.** `policy-check` could have
+reported which tools the corpus calls with an egress-shaped field, since that list is
+easy to produce and would have looked more thorough. It asks instead which fields
+*name a recipient*, because that is the set a policy file is expected to have an
+opinion about, and it takes that set from the policy module beside the rules that
+use it. An earlier version read provenance's narrower host-extracting list and was
+blind to `attendees` — the one surface with no host to extract, and the one the layer
+was built for. A check that cannot fail on the bug it was written for is worse than
+no check, because it gets trusted.
 
 **A policy file is configuration, and configuration is not code.** The layer it
 enables is deterministic, offline, and about as clever as an allowlist, but the list
@@ -526,7 +585,7 @@ src/airlock/
   provenance/  taint sources, egress sinks, destination trust
                (rollback on block, so one refused leak cannot poison a session)
   audit/       hash-chained log, chain verification
-  eval/        corpus replay, metrics, report generation
+  eval/        corpus replay, metrics, report generation, policy-file check
 corpus/        labelled transcripts + benign traffic
 examples/      policy files, e.g. the corpus workspace's
 tests/         unit + integration (real MCP servers)
