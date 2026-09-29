@@ -248,6 +248,11 @@ def render(report: Report, *, title: str = "airlock evaluation") -> str:
     latency = report.latency()
 
     def _ns(value: float) -> str:
+        # Seconds are a real case here, not a hypothetical one: the semantic
+        # layer asks a local model, and "840.30ms" would read as a rounding
+        # error rather than as the price of a layer an agent waits on.
+        if value >= 1_000_000_000:
+            return f"{value / 1_000_000_000:.2f}s"
         if value >= 1_000_000:
             return f"{value / 1_000_000:.2f}ms"
         if value >= 1_000:

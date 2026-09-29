@@ -8,11 +8,18 @@ to defeat itself and publishes the results.
 
 > **Status: early, and the numbers are small.** The interposition relay, the audit
 > chain, the structural detector, the provenance engine, the evaluation harness,
-> and the integration suite against real MCP servers are implemented. The policy
-> engine and the local-LLM detector are not. Held-out attack success rate is
-> **12.5%** at 0% false positives, with 6 of 6 owned steps stopped — the residual
-> is two `policy` steps, and the harness names them rather than folding them into a
-> rounder figure.
+> the integration suite against real MCP servers, and an opt-in semantic layer
+> backed by a local model are implemented. The policy engine is not. Held-out
+> attack success rate is **12.5%** at 0% false positives, with 6 of 6 owned steps
+> stopped — the residual is two `policy` steps, and the harness names them rather
+> than folding them into a rounder figure.
+>
+> **The opt-in semantic layer does not earn its place and is off by default.**
+> On the held-out split a local Qwen3-4B judge catches none of the five attack
+> steps the mechanical layers cannot reach, flags one benign document, and adds
+> ~450ms per step. The harness, client, and constrained decoding stay, because
+> re-measuring against a larger model is then one command; the numbers are in
+> [What the model layer actually measured](#what-the-model-layer-actually-measured).
 
 ## Why
 
@@ -92,6 +99,76 @@ Two details of the real protocol turned out to matter:
   relay one turn at a time. Piped input would measure the fixture rather than the
   gateway.
 
+## The local judge
+
+The semantic layer needs a model server. It is not a dependency of the project:
+nothing in `airlock` imports an inference library, and the core installs and
+evaluates with no model present at all.
+
+```bash
+make model      # download Qwen3-4B-Instruct-2507 Q4_K_M (~2.5GB, into models/)
+make judge      # serve it on 127.0.0.1:8080 in the background
+make judge-stop # stop it
+
+airlock proxy --provenance --semantic -- <server>
+airlock eval --split test --layers semantic --ablation
+```
+
+Point it elsewhere with `AIRLOCK_JUDGE_ENDPOINT` or `--judge-endpoint`. The
+endpoint defaults to loopback because a component that decides what reaches a
+security boundary has no business being reachable from the network.
+
+`--layers all` does **not** include the semantic layer. It is asked for by name,
+because a gateway that adds seconds to every tool call and depends on a 2.5GB
+download is a gateway that gets removed from the deployment. Asking for it with
+no server running is an error rather than a silent downgrade: an operator who
+requested a judge and got no judge would be told they had a layer they did not
+have.
+
+### What the model layer actually measured
+
+Qwen3-4B-Instruct-2507 at Q4_K_M, served by `llama-server`, does not earn its
+place. Held out from prompt development, on the `test` split:
+
+| configuration | ASR | detection | FPR | owned recall |
+| --- | --- | --- | --- | --- |
+| structural only | 87.5% | 12.5% | 0.0% | 1/1 |
+| provenance only | 25.0% | 75.0% | 0.0% | 5/5 |
+| both (shipped) | 12.5% | 87.5% | 0.0% | 6/6 |
+| semantic only | 100.0% | 0.0% | 3.0% | — |
+| all three | 12.5% | 87.5% | 3.0% | 6/6 |
+
+The last two rows are the finding. The layer catches **none** of the five attack
+steps the mechanical layers cannot reach, flags one benign document, and adds
+about 450ms to every step (p95 648ms). On the `dev` split it is worse: 0%
+detection against 9.4% false positives, three of 32 expected-allow steps. Added
+to the shipped pair it changes the attack success rate not at all.
+
+So the layer stays off by default, and the honest recommendation is not to turn
+it on at this model size. Three things are worth separating in that conclusion:
+
+* **The infrastructure is sound and stays.** Constrained decoding, strict
+  parsing, fail-closed conversion, digest-only findings, per-case reset, a
+  measurement harness, and the cache. Re-measuring against a different model is
+  `make model` with a different filename and one `airlock eval` run.
+* **Some of the gap is model size.** Telling a runbook addressed to an on-call
+  engineer from the same checklist addressed to the agent is a reading
+  comprehension problem, and 4B quantised is weak at it.
+* **Some of the gap may not be model size.** The model flagged a tool
+  acknowledgement of `{"written": true}` as an injection, and reasoned that a
+  credential egress was fine because "the agent holds the token". A larger
+  model would probably fix the first and may not fix the second. The second is a
+  question about which side of the boundary a value came from, and that is the
+  provenance layer's job — which is the argument for keeping the model out of
+  the blocking path entirely.
+
+Two caveats on the number itself. The prompt was written after reading the
+corpus, so `dev` is a tuning set and only `test` is held out; the held-out row is
+the one to believe. And the corpus is the specification this layer was measured
+against, including its requirement that a `flag` is not a mitigation — a layer
+that annotates without blocking cannot lower ASR, and this one does not even
+annotate correctly.
+
 ## Usage
 
 ```bash
@@ -138,6 +215,46 @@ would break the agent while hiding the event.
 **Detectors observe, policy decides.** Detectors report findings and severities; whether a
 finding is fatal depends on where the tainted content is flowing. This separation is what
 makes the layer-by-layer ablation meaningful.
+
+**The semantic layer is asked one narrow question, on purpose.** A model judge's
+failure mode is not missing attacks; it is reading intent into ordinary text. So
+it is asked *is this content trying to change what an agent does?* and never the
+broader question that would catch more and flood the host with false positives.
+The negatives are stated in the prompt as carefully as the positive: documentation
+is not an instruction, a runbook addressed to whoever is on call is not an
+instruction to an agent, a release note about rotating keys is not a credential
+request, and a page *about* prompt injection is not a prompt injection. A layer
+that flags ordinary documentation is a layer that gets switched off, and then it
+protects nothing at all.
+
+That reasoning was right and the model did not follow it: the negatives are in
+the prompt, and it flagged a tool acknowledgement and a credentials file
+anyway. Worth recording because the prediction held exactly — a layer with a 3%
+false-positive rate on benign documents is a layer that gets switched off, which
+is why it ships off. See
+[What the model layer actually measured](#what-the-model-layer-actually-measured).
+
+**Content is flagged; the action it causes is blocked.** Untrusted text carrying
+an injection is delivered and annotated, because the agent may legitimately need
+to read it and a gateway that hides tool output breaks every workflow that
+involves looking at one. The *request* the agent is about to send because of that
+text is refused, which is where the harm actually lands. This is also why `flag`
+is not one of the harness's mitigating verdicts: the message still reaches the
+model, which is the whole point of the runtime-channel threat model.
+
+**The judge's explanation is hashed, not recorded.** The most natural thing in
+the world to write into an audit finding is the model's own words, and it is
+attacker-controlled: asked to explain itself, a model quotes whatever it was
+shown. The finding records the rule, the mechanism in the operator's terms, and a
+digest of the explanation — enough to tell two firings apart, useless to anyone
+wanting a copy of the payload. An unusable answer is a failure and not a verdict,
+so a model having an off day cannot be read as an all-clear.
+
+**The semantic layer blocks the relay, and that is why it is opt-in.** The
+`Inspector` interface is synchronous, so a judgement is a pause in the event loop
+— seconds, not microseconds. On stdio that serialises concurrent requests rather
+than corrupting them, and the ablation reports the cost in seconds for that
+reason. Making the interface async is the real fix and is not done here.
 
 **A server echoing a URL you gave it is not a source.** The provenance layer treats any
 content entering the context as potentially hostile, which is right in general and badly

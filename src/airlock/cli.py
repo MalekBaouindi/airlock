@@ -21,12 +21,54 @@ from airlock import __version__
 from airlock.audit.log import AuditLog, iter_records, verify_chain
 from airlock.gateway.stdio_proxy import StdioProxy, UpstreamSpec
 from airlock.inspect.base import Inspector, InspectorPipeline
+from airlock.inspect.semantic import SemanticInspector
 from airlock.inspect.structural import StructuralInspector
+from airlock.llm.client import LocalModel
 from airlock.provenance.inspector import ProvenanceInspector
 
 DEFAULT_AUDIT_PATH = Path(".airlock/audit.jsonl")
 
 SEVERITY_CHOICES = ("info", "low", "medium", "high", "critical", "none")
+
+
+def _judge() -> LocalModel:
+    """The local model, refusing to build a layer that cannot answer.
+
+    `JudgeUnavailable` here is a configuration error rather than a detection
+    failure, so it is reported as one and the command exits. The alternative --
+    starting up with a layer that raises on the first message -- would make the
+    gateway block everything, which is a far worse way to learn that the model
+    server is not running.
+    """
+    judge = LocalModel.from_env()
+    if not judge.available():
+        raise SystemExit(
+            f"error: the semantic layer needs a model server; {judge.describe()} is not answering"
+        )
+    return judge
+
+
+def build_layers(choice: str) -> list[Inspector]:
+    """Assemble the requested detector layers.
+
+    At module level rather than inside `cmd_eval` so the shipped default and
+    the ablation agree by construction: there is one answer to "what does
+    `--layers all` mean", and a test can ask it.
+
+    Layers are constructed independently so the ablation can attribute a
+    detection to the layer that earned it rather than to the pipeline. Note
+    that `all` does not mean every layer that exists: the semantic layer costs
+    seconds per message and needs a model server, so it is asked for by name.
+    """
+    if choice == "none":
+        return []
+    if choice == "structural":
+        return [StructuralInspector()]
+    if choice == "provenance":
+        return [ProvenanceInspector()]
+    if choice == "semantic":
+        return [SemanticInspector(model=_judge())]
+    return [StructuralInspector(), ProvenanceInspector()]
 
 
 def build_proxy_parser() -> argparse.ArgumentParser:
@@ -66,6 +108,19 @@ def build_proxy_parser() -> argparse.ArgumentParser:
         help="enable the provenance layer: track taint sources and block egress",
     )
     parser.add_argument(
+        "--semantic",
+        action="store_true",
+        help=(
+            "enable the semantic layer: judge untrusted content with a local "
+            "model (needs a model server; see README)"
+        ),
+    )
+    parser.add_argument(
+        "--judge-endpoint",
+        default=None,
+        help="where the local model is served (default: $AIRLOCK_JUDGE_ENDPOINT)",
+    )
+    parser.add_argument(
         "upstream",
         nargs=argparse.REMAINDER,
         help="-- followed by the upstream server command and its arguments",
@@ -98,6 +153,21 @@ def cmd_proxy(argv: Sequence[str]) -> int:
         inspectors.append(StructuralInspector(block_at=block_at))
     if args.provenance:
         inspectors.append(ProvenanceInspector())
+    if args.semantic:
+        judge = LocalModel.from_env()
+        if args.judge_endpoint:
+            judge.endpoint = args.judge_endpoint
+        if not judge.available():
+            # Refuse to start rather than start without the layer. A gateway
+            # asked for a judge and silently given no judge is a gateway
+            # reporting protection it does not have.
+            print(
+                f"error: --semantic needs a model server; {judge.describe()} "
+                "is not answering. Start it, or pass --judge-endpoint.",
+                file=sys.stderr,
+            )
+            return 2
+        inspectors.append(SemanticInspector(model=judge))
 
     pipeline = InspectorPipeline(inspectors=inspectors)
     audit = AuditLog(args.audit, capture=args.capture)
@@ -229,24 +299,10 @@ def cmd_eval(argv: Sequence[str]) -> int:
     parser.add_argument(
         "--layers",
         default="all",
-        choices=("all", "structural", "provenance", "none"),
+        choices=("all", "structural", "provenance", "semantic", "none"),
         help="which detector layers to run (default: all)",
     )
     args = parser.parse_args(list(argv))
-
-    def build_layers(choice: str) -> list[Inspector]:
-        """Assemble the requested detector layers.
-
-        Layers are constructed independently so the ablation can attribute a
-        detection to the layer that earned it rather than to the pipeline.
-        """
-        if choice == "none":
-            return []
-        if choice == "structural":
-            return [StructuralInspector()]
-        if choice == "provenance":
-            return [ProvenanceInspector()]
-        return [StructuralInspector(), ProvenanceInspector()]
 
     if not args.corpus.exists():
         print(f"error: no such corpus: {args.corpus}", file=sys.stderr)
@@ -303,6 +359,35 @@ def cmd_eval(argv: Sequence[str]) -> int:
                 "the configuration `airlock proxy` runs with --provenance",
             ),
         ]
+        # The semantic layer costs seconds per message, so it is only worth
+        # running in an ablation when a model is actually there to run. Adding
+        # the row unconditionally would fill the table with zeros for a
+        # server that is not running, which reads as "the layer is useless"
+        # rather than "the layer was not measured".
+        judge = LocalModel.from_env()
+        if judge.available():
+            configurations.extend(
+                [
+                    (
+                        "semantic only",
+                        [SemanticInspector(model=judge)],
+                        "intent in untrusted content and the actions it causes",
+                    ),
+                    (
+                        "all three",
+                        [
+                            StructuralInspector(),
+                            ProvenanceInspector(),
+                            SemanticInspector(model=judge),
+                        ],
+                        "everything, including the model",
+                    ),
+                ]
+            )
+        else:
+            console.print(
+                f"[dim]semantic layer skipped: no model server at {judge.endpoint}[/dim]\n"
+            )
         for name, layers, _note in configurations:
             run = replay(cases, layers, split=split)
             owned = [
