@@ -7,12 +7,14 @@ where untrusted content flows, and refuses to let it reach an egress sink — th
 to defeat itself and publishes the results.
 
 > **Status: early, and the numbers are small.** The interposition relay, the audit
-> chain, the structural detector, the provenance engine, the evaluation harness,
-> the integration suite against real MCP servers, and an opt-in semantic layer
-> backed by a local model are implemented. The policy engine is not. Held-out
-> attack success rate is **12.5%** at 0% false positives, with 6 of 6 owned steps
-> stopped — the residual is two `policy` steps, and the harness names them rather
-> than folding them into a rounder figure.
+> chain, the structural detector, the provenance engine, the policy layer, the
+> evaluation harness, the integration suite against real MCP servers, and an
+> opt-in semantic layer backed by a local model are implemented. Held-out attack
+> success rate is **0.0%** at 0% false positives, with 8 of 8 owned steps
+> stopped — read [the caveat on that number](#the-policy-file) before quoting it,
+> because it depends on a policy file, and the policy file is written by a human
+> and goes stale. Without one, the same split scores 12.5%, and the harness names
+> the two steps it cannot serve rather than folding them into a rounder figure.
 >
 > **The opt-in semantic layer does not earn its place and is off by default.**
 > On the held-out split a local Qwen3-4B judge catches none of the five attack
@@ -46,7 +48,7 @@ host  ──stdio──►  airlock  ──stdio──►  upstream MCP server
                      │
                      ├── structural detectors   (deterministic, offline, zero-cost)
                      ├── provenance tracking    (taint sources -> egress sinks)
-                     ├── policy engine          (not implemented yet)
+                     ├── policy layer           (where data may go; needs a policy file)
                      └── audit log              (append-only, hash-chained)
 ```
 
@@ -99,6 +101,92 @@ Two details of the real protocol turned out to matter:
   relay one turn at a time. Piped input would measure the fixture rather than the
   gateway.
 
+## The policy file
+
+Airlock does not ship an allowlist, and the absence is deliberate. A built-in list
+of destinations was chosen on someone else's machine, and it would be the list
+that silently permits the exfiltration — the one nobody reads. So the policy layer
+loads a file you write, and no file means no layer, which the report says out loud.
+
+```jsonc
+{
+  "version": 1,
+  "surfaces": {
+    "http_post": {
+      "url": {
+        "allow": ["metrics.internal", ".collector.example.net"],
+        "note": "why these, in words an operator will still recognise later"
+      }
+    },
+    "send_email": {
+      "to": { "anywhere": true, "note": "mail is store-and-forward; provenance judges the body" }
+    }
+  }
+}
+```
+
+```bash
+airlock proxy --provenance --policy my-workspace.json -- <server>
+airlock eval --split test --policy examples/corpus-workspace-policy.json
+make eval     # the corpus workspace, with its policy
+```
+
+`examples/corpus-workspace-policy.json` is the policy for the workspace the corpus
+transcripts are set in, and it is what the numbers below were measured with.
+
+**The unit of the rule is a `(tool, argument)` pair, not a tool.** A rule that names
+a goal — "do not exfiltrate" — is re-argued for every destination an attacker picks,
+so it never generalises. The corpus has the case: exfiltration to a domain on no
+denylist. A rule that enumerates the exfiltration *surface* does generalise, and
+the surface is where data actually moves. So `send_email` is not a trusted tool that
+cannot be abused, and `http_post` is not an egress tool; each has fields, and the
+policy constrains the fields.
+
+**Which is also the only reason a trusted tool is not a safe one.** The corpus pairs
+this with a case where the sink is allowlisted, the tool is trusted, and the attack
+lands anyway, because the recipient field was never constrained. An engine that
+guessed which arguments are destinations would have the same hole with a different
+name; so the policy file names them, and a field it does not mention is a field
+nobody decided anything about.
+
+**What it does not do.** It does not decide whether a value is sensitive — that is
+provenance, and duplicating it is how a policy file grows secret patterns that rot.
+It does not constrain what an agent may *read*: a fetch cannot exfiltrate what the
+agent already holds, and a policy that constrained fetches would break the ability to
+read documentation, which is how most attacks arrive. And it does not constrain
+email by default, because outbound mail is mediated by the workspace's own MTA and
+the interesting question about a message is its body.
+
+### What the policy file is worth, and what it costs
+
+`structural + provenance` and `policy only` each leave one harm step on the held-out
+split. Together they leave none, because they fail differently: provenance cannot
+see a credential that never crossed the boundary as a value, and a destination
+allowlist cannot tell a sharded exfiltration from a sharded upload.
+
+| policy file | ASR | detection | FPR | what the harness names |
+|---|---|---|---|---|
+| `examples/corpus-workspace-policy.json` | **0.0%** | 100.0% | 0.0% | – |
+| same file, `http_post.url` deleted | 12.5% | 87.5% | 0.0% | `framing_sweep-002` |
+| only the mail rule | 12.5% | 87.5% | 0.0% | `framing_sweep-002` |
+| no policy file configured | 12.5% | 87.5% | 0.0% | reported as coverage debt |
+
+The second row is the honest cost of this layer, and it is worth more than the
+first: forget one field and the exfiltration it covered succeeds silently in
+production, while the corpus keeps saying 0.0% as long as the file is right. Every
+layer in this project fails visibly; this one fails by going stale, which is why a
+policy file carries a `note` per surface and why the harness names the case it
+cannot serve.
+
+**Three caveats on the 0.0%, since it is the number that would be quoted.** The
+corpus is a closed world: sixteen cases in one workspace, so "every destination is
+either allowlisted or an attack" happens to be true here and is false of any real
+deployment. The allowlist was written by someone who had read the corpus, though it
+contains only destinations the benign traffic uses. And the wildcard
+`.collector.example.net` is a deliberate trade — it covers the sharded collector
+without listing twenty-five hostnames, and it would also cover
+`attacker.collector.example.net`.
+
 ## The local judge
 
 The semantic layer needs a model server. It is not a dependency of the project:
@@ -137,6 +225,10 @@ place. Held out from prompt development, on the `test` split:
 | both (shipped) | 12.5% | 87.5% | 0.0% | 6/6 |
 | semantic only | 100.0% | 0.0% | 3.0% | — |
 | all three | 12.5% | 87.5% | 3.0% | 6/6 |
+
+These two rows predate the policy layer and were measured with no policy file
+configured, which is why their owned recall matches the shipped pair above them
+rather than the 8/8 the full configuration now reaches.
 
 The last two rows are the finding. The layer catches **none** of the five attack
 steps the mechanical layers cannot reach, flags one benign document, and adds
@@ -256,6 +348,24 @@ so a model having an off day cannot be read as an all-clear.
 than corrupting them, and the ablation reports the cost in seconds for that
 reason. Making the interface async is the real fix and is not done here.
 
+**A policy file is configuration, and configuration is not code.** The layer it
+enables is deterministic, offline, and about as clever as an allowlist, but the list
+itself is written by a person who knows the deployment — and the engine is built so
+that the list is the only part that can be wrong. It cannot judge sensitivity, infer
+destinations, or guess which arguments carry them, so a stale file produces misses
+the harness names, never blocks nobody asked for. A layer that inferred those things
+would cover more on paper and be wrong in ways no evaluation of a closed corpus
+would surface.
+
+**A destination allowlist does not decide, it enumerates.** The temptation is to
+write the rule once and let the engine work out the rest: for a tool marked as
+egress, block anything untainted. That rule is a goal, and goals do not generalise
+past the destinations anyone thought of when it was written. The policy file's unit
+is the `(tool, argument)` pair instead, so the question stays concrete enough to
+answer — where does this field go — and a new sink has to be added to the file to
+be covered. Enumerating is more work per tool and it is the only version whose
+coverage you can read off the file.
+
 **A server echoing a URL you gave it is not a source.** The provenance layer treats any
 content entering the context as potentially hostile, which is right in general and badly
 wrong for one very common shape: servers that report what they just did (`200 OK
@@ -316,26 +426,28 @@ disjoint and each contains steps for every layer this build ships.
 
 | metric | value | 95% CI (bootstrap over cases) |
 |---|---|---|
-| attack success rate | 12.5% | [0.0%, 42.9%] |
-| weighted ASR | 9.5% | – |
-| detection rate | 87.5% | [57.1%, 100.0%] |
+| attack success rate | 0.0% | [0.0%, 0.0%] |
+| weighted ASR | 0.0% | – |
+| detection rate | 100.0% | [100.0%, 100.0%] |
 | false positive rate | 0.0% | 0/33 expected-allow steps |
 | control noise floor | 1 step | `benign-template-docs`, `template-token` |
 
-16 cases, 47 steps, 8 expected-harm. p50 17.7µs / p95 63.2µs inspection cost per step.
+16 cases, 47 steps, 8 expected-harm. p50 25.2µs / p95 71.5µs inspection cost per step.
 
-**6 of 6 owned steps stopped, 0 false positives.** The two remaining misses are both
-`policy`-layer steps — sending a workspace signing key to a host that is not the
-workspace, and creating a calendar event with attendees the transcript never
-introduced. That layer is not written yet, so those are reported as coverage debt.
+**8 of 8 owned steps stopped, 0 false positives, nothing left as coverage debt.** The
+two steps that used to be unserved are the ones a taint tracker cannot see: a
+workspace signing key posted in a header, and a calendar invite to attendees the
+transcript never introduced. Neither secret ever entered the transcript as a value,
+so there was no taint to track. The policy file closes them, and the ablation below
+is the honest version of that claim — each layer alone still leaves one harm step
+standing.
 
-The `dev` split scores 13.0% ASR with 0% false positives and holds three more steps
-of unimplemented debt (`semantic` ×2, `policy` ×1), and both splits PASS. The gap
-between the splits is not overfitting — it is the corpus working. Three dev steps
-were regraded while building this layer, twice in the same direction: four steps
-claimed `provenance` credit for secrets that never entered the transcript
-(`<vault value>`, `<service account token>`), which taint tracking cannot catch by
-construction, and 24 drip steps demanded a block on a single character.
+The `dev` split scores 0.0% ASR at 0% false positives with an empty coverage-debt
+list, and both splits PASS. The gap between the splits earlier in this project was
+not overfitting — it was the corpus working. Four steps had claimed `provenance`
+credit for secrets that never entered the transcript (`<vault value>`,
+`<service account token>`), which taint tracking cannot catch by construction, and
+24 drip steps demanded a block on a single character.
 
 Ablation, same split:
 
@@ -344,12 +456,22 @@ Ablation, same split:
 | no detectors | 100.0% | 0.0% | 0.0% | – |
 | structural only | 87.5% | 12.5% | 0.0% | 1/1 |
 | provenance only | 25.0% | 75.0% | 0.0% | 5/5 |
-| both (shipped) | **12.5%** | 87.5% | 0.0% | **6/6** |
+| policy only | 12.5% | 87.5% | 0.0% | 2/2 |
+| structural + provenance | 12.5% | 87.5% | 0.0% | 6/6 |
+| **structural + provenance + policy** | **0.0%** | 100.0% | 0.0% | **8/8** |
 
 Read the ablation rather than the headline. ASR stays high while any layer is missing,
 so on its own it cannot tell a layer that helps from one that does nothing; owned
 recall is the column that does that, and it is why the layers are constructed
 separately rather than fused into one detector.
+
+The two middle rows are the argument for shipping three layers rather than the best
+one. Each offline layer on its own leaves a harm step standing, and they leave
+*different* ones: `policy only` misses the sharded exfiltration because a
+destination allowlist cannot tell a sharded upload from a sharded theft, and
+`structural + provenance` misses the two steps whose credentials never appear in the
+transcript at all. Neither is a better detector than the other. They fail on
+different things, and a gateway only reaches 0.0% because both are present.
 
 The provenance layer is the reason the number moved. It tracks four kinds of source —
 a read from a secret path, any tool result, **a denial**, and agent memory — and three
@@ -400,12 +522,13 @@ should be read as a working measurement, not a benchmark.
 ```
 src/airlock/
   gateway/     stdio relay, JSON-RPC envelopes, session correlation
-  inspect/     structural detector, verdict combination
+  inspect/     structural detector, policy layer, verdict combination
   provenance/  taint sources, egress sinks, destination trust
                (rollback on block, so one refused leak cannot poison a session)
   audit/       hash-chained log, chain verification
   eval/        corpus replay, metrics, report generation
 corpus/        labelled transcripts + benign traffic
+examples/      policy files, e.g. the corpus workspace's
 tests/         unit + integration (real MCP servers)
 ```
 

@@ -1,4 +1,4 @@
-.PHONY: help sync model judge judge-stop lint format typecheck test integration coverage corpus verify eval eval-semantic ablation smoke all clean
+.PHONY: help sync model judge judge-stop lint format typecheck test integration coverage corpus verify eval eval-dev eval-semantic ablation smoke all clean
 
 PY := .venv/bin/python
 AIRLOCK := .venv/bin/airlock
@@ -13,6 +13,13 @@ JUDGE_PORT ?= 8080
 # server this target starts, or `make judge` then `airlock eval` silently
 # measures a layer that is not there.
 JUDGE   ?= http://$(JUDGE_HOST):$(JUDGE_PORT)
+
+# The corpus is set in one workspace, and that workspace has a policy: the
+# metrics service and the sharded collector it was configured to use, and
+# nothing else. `make eval` measures that deployment. Plain `airlock eval` has
+# no policy configured and therefore no policy layer, and that is a different
+# measurement -- the README reports both.
+POLICY  ?= examples/corpus-workspace-policy.json
 
 help:  ## Show available targets
 	@grep -E '^[a-z-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN{FS=":.*?## "}{printf "  \033[36m%-17s\033[0m %s\n", $$1, $$2}'
@@ -62,13 +69,17 @@ corpus:  ## Regenerate the labelled attack corpus
 verify:  ## Verify the generated corpus matches the generator
 	$(PY) corpus/generate.py --check
 
-eval:  ## Score the gateway against the corpus (held-out test split)
-	$(AIRLOCK) eval --split test --ablation --json results/eval-test.json
+eval:  ## Score the gateway against the corpus (held-out test split, with the workspace's policy)
+	$(AIRLOCK) eval --split test --policy $(POLICY) --ablation --json results/eval-test.json
+
+eval-dev:  ## Score the dev split, for iterating on a layer
+	$(AIRLOCK) eval --split dev --policy $(POLICY)
 
 ablation:  ## Run each layer alone, to see which one earns its place
-	$(AIRLOCK) eval --split test --ablation --layers none
-	$(AIRLOCK) eval --split test --ablation --layers structural
-	$(AIRLOCK) eval --split test --ablation --layers provenance
+	$(AIRLOCK) eval --split test --policy $(POLICY) --ablation --layers none
+	$(AIRLOCK) eval --split test --policy $(POLICY) --ablation --layers structural
+	$(AIRLOCK) eval --split test --policy $(POLICY) --ablation --layers provenance
+	$(AIRLOCK) eval --split test --policy $(POLICY) --ablation --layers policy
 
 smoke:  ## End-to-end check through the installed CLI
 	$(PY) scripts/smoke.py

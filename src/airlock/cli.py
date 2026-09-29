@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import os
 import sys
 from collections.abc import Sequence
 from pathlib import Path
@@ -21,6 +22,7 @@ from airlock import __version__
 from airlock.audit.log import AuditLog, iter_records, verify_chain
 from airlock.gateway.stdio_proxy import StdioProxy, UpstreamSpec
 from airlock.inspect.base import Inspector, InspectorPipeline
+from airlock.inspect.policy import Policy, PolicyError, PolicyInspector
 from airlock.inspect.semantic import SemanticInspector
 from airlock.inspect.structural import StructuralInspector
 from airlock.llm.client import LocalModel
@@ -48,7 +50,7 @@ def _judge() -> LocalModel:
     return judge
 
 
-def build_layers(choice: str) -> list[Inspector]:
+def build_layers(choice: str, policy: Policy | None = None) -> list[Inspector]:
     """Assemble the requested detector layers.
 
     At module level rather than inside `cmd_eval` so the shipped default and
@@ -68,7 +70,38 @@ def build_layers(choice: str) -> list[Inspector]:
         return [ProvenanceInspector()]
     if choice == "semantic":
         return [SemanticInspector(model=_judge())]
-    return [StructuralInspector(), ProvenanceInspector()]
+    if choice == "policy":
+        if policy is None:
+            raise SystemExit(
+                "error: --layers policy needs a policy file; pass --policy PATH "
+                "or set AIRLOCK_POLICY"
+            )
+        return [PolicyInspector(policy)]
+    layers: list[Inspector] = [StructuralInspector(), ProvenanceInspector()]
+    # `all` includes the policy layer exactly when a policy was supplied, and
+    # the proxy resolves its policy the same way. A layer that appears in one
+    # command and not the other is how a published number stops describing the
+    # thing it was measured on.
+    if policy is not None:
+        layers.append(PolicyInspector(policy))
+    return layers
+
+
+def _load_policy(explicit: str | None) -> Policy | None:
+    """The policy for this run, or None if the operator did not configure one.
+
+    Resolution is flag, then environment, then nothing. There is no default
+    file and no built-in allowlist: the absence of a policy has to be visible as
+    the absence of a layer, because a policy that silently permits everything
+    is indistinguishable from no policy at all until the day it matters.
+    """
+    path = explicit or os.environ.get("AIRLOCK_POLICY") or None
+    if path is None:
+        return None
+    try:
+        return Policy.load(path)
+    except PolicyError as exc:
+        raise SystemExit(f"error: {exc}") from exc
 
 
 def build_proxy_parser() -> argparse.ArgumentParser:
@@ -116,6 +149,16 @@ def build_proxy_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--policy",
+        type=Path,
+        default=None,
+        help=(
+            "policy file: where data may go (default: $AIRLOCK_POLICY). "
+            "Supplying one is what makes the policy layer part of the "
+            "shipped configuration"
+        ),
+    )
+    parser.add_argument(
         "--judge-endpoint",
         default=None,
         help="where the local model is served (default: $AIRLOCK_JUDGE_ENDPOINT)",
@@ -153,6 +196,9 @@ def cmd_proxy(argv: Sequence[str]) -> int:
         inspectors.append(StructuralInspector(block_at=block_at))
     if args.provenance:
         inspectors.append(ProvenanceInspector())
+    policy = _load_policy(str(args.policy) if args.policy else None)
+    if policy is not None:
+        inspectors.append(PolicyInspector(policy))
     if args.semantic:
         judge = LocalModel.from_env()
         if args.judge_endpoint:
@@ -299,8 +345,14 @@ def cmd_eval(argv: Sequence[str]) -> int:
     parser.add_argument(
         "--layers",
         default="all",
-        choices=("all", "structural", "provenance", "semantic", "none"),
+        choices=("all", "structural", "provenance", "policy", "semantic", "none"),
         help="which detector layers to run (default: all)",
+    )
+    parser.add_argument(
+        "--policy",
+        type=Path,
+        default=None,
+        help="policy file: where data may go (default: $AIRLOCK_POLICY)",
     )
     args = parser.parse_args(list(argv))
 
@@ -321,7 +373,14 @@ def cmd_eval(argv: Sequence[str]) -> int:
         return 2
 
     split = None if args.split == "all" else args.split
-    inspectors = build_layers(args.layers)
+    policy = _load_policy(str(args.policy) if args.policy else None)
+    inspectors = build_layers(args.layers, policy)
+    if policy is not None and args.layers not in ("all", "policy"):
+        print(
+            f"note: policy file {policy.source} loaded but `--layers "
+            f"{args.layers}` does not include the policy layer",
+            file=sys.stderr,
+        )
     report = replay(cases, inspectors, split=split)
 
     if args.ablation:
@@ -354,16 +413,34 @@ def cmd_eval(argv: Sequence[str]) -> int:
                 "taint sources, sharded egress, untrusted destinations",
             ),
             (
-                "both (shipped)",
+                "structural + provenance",
                 [StructuralInspector(), ProvenanceInspector()],
-                "the configuration `airlock proxy` runs with --provenance",
+                "shipped by default: no policy file configured",
             ),
         ]
-        # The semantic layer costs seconds per message, so it is only worth
-        # running in an ablation when a model is actually there to run. Adding
-        # the row unconditionally would fill the table with zeros for a
-        # server that is not running, which reads as "the layer is useless"
-        # rather than "the layer was not measured".
+        # The policy layer gets a row of its own and a row inside the full
+        # offline configuration. Two rows rather than one, because "does the
+        # policy layer help?" and "is the shipped configuration enough?" are
+        # different questions, and answering the second with the first is how a
+        # policy file gets credited with a taint tracker's work.
+        if policy is not None:
+            configurations.append(
+                (
+                    "policy only",
+                    [PolicyInspector(policy)],
+                    f"where data may go, from {policy.source}",
+                )
+            )
+            configurations.append(
+                (
+                    "structural + provenance + policy",
+                    [StructuralInspector(), ProvenanceInspector(), PolicyInspector(policy)],
+                    "the full mechanical configuration, all three offline",
+                )
+            )
+        offline: list[Inspector] = [StructuralInspector(), ProvenanceInspector()]
+        if policy is not None:
+            offline.append(PolicyInspector(policy))
         judge = LocalModel.from_env()
         if judge.available():
             configurations.extend(
@@ -374,13 +451,10 @@ def cmd_eval(argv: Sequence[str]) -> int:
                         "intent in untrusted content and the actions it causes",
                     ),
                     (
-                        "all three",
-                        [
-                            StructuralInspector(),
-                            ProvenanceInspector(),
-                            SemanticInspector(model=judge),
-                        ],
-                        "everything, including the model",
+                        "everything" + (" (with policy)" if policy else ""),
+                        [*offline, SemanticInspector(model=judge)],
+                        "the offline layers plus the model, which is a "
+                        "configuration nothing should be run with",
                     ),
                 ]
             )
