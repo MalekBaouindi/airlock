@@ -30,6 +30,12 @@ class SessionContext:
     #: request leg and consumed on the response leg.
     _pending: dict[Id, str] = field(default_factory=dict)
 
+    #: The method that produced the response currently being inspected. Set by
+    #: :meth:`note_response` *before* detectors run, and readable without
+    #: consuming -- an inspector that needs the correlation cannot be the same
+    #: call that destroys it, or every detector after the first would see None.
+    inbound_method: str | None = None
+
     def note_request(self, message: Message) -> None:
         """Record an outgoing request so its response can be attributed later."""
         method = message.method
@@ -38,6 +44,30 @@ class SessionContext:
         self.methods_seen[method] += 1
         if message.is_request:
             self._pending[message.id] = method
+
+    def settle(self, request_id: Id) -> None:
+        """Mark a request as answered by the gateway itself.
+
+        A blocked request never reaches the upstream, so no response will ever
+        arrive for it -- but the relay has already answered the host with a
+        synthetic error. Leaving it pending means the abandoned-request sweep
+        treats it as unanswered and sends a *second* error for the same id, so
+        the host sees one request produce two responses. JSON-RPC has no way to
+        express that, and a client that trusts the first error is now reading a
+        reply it never asked for.
+        """
+        self._pending.pop(request_id, None)
+
+    def note_response(self, message: Message) -> str | None:
+        """Expose a response's originating method to detectors.
+
+        Non-destructive. Pair it with :meth:`method_for_response` to consume the
+        correlation once the message has been processed.
+        """
+        if not message.is_response:
+            return None
+        self.inbound_method = self._pending.get(message.id)
+        return self.inbound_method
 
     def method_for_response(self, message: Message) -> str | None:
         """Return the method that produced this response, then forget it."""

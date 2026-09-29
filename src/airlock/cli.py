@@ -20,8 +20,9 @@ from pathlib import Path
 from airlock import __version__
 from airlock.audit.log import AuditLog, iter_records, verify_chain
 from airlock.gateway.stdio_proxy import StdioProxy, UpstreamSpec
-from airlock.inspect.base import InspectorPipeline
+from airlock.inspect.base import Inspector, InspectorPipeline
 from airlock.inspect.structural import StructuralInspector
+from airlock.provenance.inspector import ProvenanceInspector
 
 DEFAULT_AUDIT_PATH = Path(".airlock/audit.jsonl")
 
@@ -60,6 +61,11 @@ def build_proxy_parser() -> argparse.ArgumentParser:
         help="disable the structural detector (ablation: run with no detectors)",
     )
     parser.add_argument(
+        "--provenance",
+        action="store_true",
+        help="enable the provenance layer: track taint sources and block egress",
+    )
+    parser.add_argument(
         "upstream",
         nargs=argparse.REMAINDER,
         help="-- followed by the upstream server command and its arguments",
@@ -86,12 +92,14 @@ def cmd_proxy(argv: Sequence[str]) -> int:
 
     args = build_proxy_parser().parse_args(our_args)
 
-    inspectors: list[object] = []
+    inspectors: list[Inspector] = []
     if not args.no_structural:
         block_at = None if args.block_at == "none" else args.block_at
         inspectors.append(StructuralInspector(block_at=block_at))
+    if args.provenance:
+        inspectors.append(ProvenanceInspector())
 
-    pipeline = InspectorPipeline(inspectors=inspectors)  # type: ignore[arg-type]
+    pipeline = InspectorPipeline(inspectors=inspectors)
     audit = AuditLog(args.audit, capture=args.capture)
     proxy = StdioProxy(UpstreamSpec.from_argv(upstream_argv), pipeline, audit)
     try:
@@ -201,7 +209,6 @@ def cmd_eval(argv: Sequence[str]) -> int:
 
     from airlock.eval.harness import load_corpus, replay, validate_corpus
     from airlock.eval.report import render
-    from airlock.inspect.structural import StructuralInspector
 
     parser = argparse.ArgumentParser(
         prog="airlock eval", description="Evaluate the gateway against the corpus."
@@ -219,7 +226,27 @@ def cmd_eval(argv: Sequence[str]) -> int:
         action="store_true",
         help="run the no-detector baseline alongside the full configuration",
     )
+    parser.add_argument(
+        "--layers",
+        default="all",
+        choices=("all", "structural", "provenance", "none"),
+        help="which detector layers to run (default: all)",
+    )
     args = parser.parse_args(list(argv))
+
+    def build_layers(choice: str) -> list[Inspector]:
+        """Assemble the requested detector layers.
+
+        Layers are constructed independently so the ablation can attribute a
+        detection to the layer that earned it rather than to the pipeline.
+        """
+        if choice == "none":
+            return []
+        if choice == "structural":
+            return [StructuralInspector()]
+        if choice == "provenance":
+            return [ProvenanceInspector()]
+        return [StructuralInspector(), ProvenanceInspector()]
 
     if not args.corpus.exists():
         print(f"error: no such corpus: {args.corpus}", file=sys.stderr)
@@ -238,39 +265,75 @@ def cmd_eval(argv: Sequence[str]) -> int:
         return 2
 
     split = None if args.split == "all" else args.split
-    inspectors = [StructuralInspector()]
+    inspectors = build_layers(args.layers)
     report = replay(cases, inspectors, split=split)
 
     if args.ablation:
         from rich.console import Console
         from rich.table import Table
 
-        baseline = replay(cases, [], split=split)
         console = Console()
         table = Table(title="ablation: what each layer contributes")
-        table.add_column("configuration", no_wrap=True)
-        table.add_column("ASR", justify="right", no_wrap=True)
-        table.add_column("detect", justify="right", no_wrap=True)
-        table.add_column("FPR", justify="right", no_wrap=True)
-        table.add_column("note", overflow="fold")
-        table.add_row(
-            "no detectors",
-            f"{baseline.attack_success_rate() * 100:.1f}%",
-            f"{baseline.detection_rate() * 100:.1f}%",
-            f"{baseline.false_positive_rate() * 100:.1f}%",
-            "the undefended baseline this project has to beat",
-        )
-        table.add_row(
-            "structural",
-            f"{report.attack_success_rate() * 100:.1f}%",
-            f"{report.detection_rate() * 100:.1f}%",
-            f"{report.false_positive_rate() * 100:.1f}%",
-            "Unicode and template-token carriers only",
-        )
+        table.add_column("configuration", no_wrap=True, min_width=22)
+        table.add_column("ASR", justify="right", no_wrap=True, min_width=7)
+        table.add_column("detect", justify="right", no_wrap=True, min_width=7)
+        table.add_column("FPR", justify="right", no_wrap=True, min_width=7)
+        table.add_column("owned recall", justify="right", no_wrap=True, min_width=13)
+
+        # Each configuration is run on its own so a detection can be attributed
+        # to the layer that earned it. "Owned recall" is the number that matters
+        # when reading the middle rows: ASR stays high as long as any layer is
+        # missing, so it cannot distinguish a layer that helps from one that
+        # does nothing.
+        configurations: list[tuple[str, list[Inspector], str]] = [
+            ("no detectors", [], "the undefended baseline this project has to beat"),
+            (
+                "structural only",
+                [StructuralInspector()],
+                "Unicode and template-token carriers",
+            ),
+            (
+                "provenance only",
+                [ProvenanceInspector()],
+                "taint sources, sharded egress, untrusted destinations",
+            ),
+            (
+                "both (shipped)",
+                [StructuralInspector(), ProvenanceInspector()],
+                "the configuration `airlock proxy` runs with --provenance",
+            ),
+        ]
+        for name, layers, _note in configurations:
+            run = replay(cases, layers, split=split)
+            owned = [
+                r
+                for r in run.attack_steps()
+                if r.expected.verdict in ("block", "modify") and run.owns(r.expected.layer)
+            ]
+            stopped = sum(r.is_mitigated for r in owned)
+            table.add_row(
+                name,
+                f"{run.attack_success_rate() * 100:.1f}%",
+                f"{run.detection_rate() * 100:.1f}%",
+                f"{run.false_positive_rate() * 100:.1f}%",
+                f"{stopped}/{len(owned)}" if owned else "-",
+            )
         console.print(table)
+        # Prose goes below the table. A note column steals the width the
+        # numbers need, and a one-character-wide note is worse than no note.
+        for name, _, note in configurations:
+            console.print(f"[dim]  {name}: {note}[/dim]")
+        missing = sorted(
+            {
+                r.expected.layer
+                for r in report.attack_steps()
+                if r.expected.layer and not report.owns(r.expected.layer)
+            }
+        )
         console.print(
-            "[dim]provenance, semantic and policy layers are not implemented yet; "
-            "their steps are reported as coverage debt.[/dim]\n"
+            f"[dim]Not implemented yet: {', '.join(missing) or 'nothing'}. Their "
+            "steps are reported as coverage debt, and count as successful "
+            "attacks.[/dim]\n"
         )
 
     print(render(report, title=f"airlock evaluation ({args.split} split)"))

@@ -67,6 +67,20 @@ class Inspector(Protocol):
         ...
 
 
+@runtime_checkable
+class Resettable(Protocol):
+    """A detector that accumulates state across messages.
+
+    A stateful layer is the whole point of the provenance engine -- an attack
+    spread over twenty requests is invisible to a per-message detector -- but
+    that same state makes it *unusable* in an evaluation unless it can be
+    cleared. Sharing one instance across cases would let case 1's taint decide
+    case 2's verdict, which is not a measurement of anything.
+    """
+
+    def reset(self) -> None: ...
+
+
 @dataclass(frozen=True, slots=True)
 class PipelineResult:
     action: Decision

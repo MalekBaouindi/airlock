@@ -156,11 +156,39 @@ class TestClassify:
         assert classify(StepExpectation("allow", "", None), actual) == "false-positive"  # type: ignore[arg-type]
 
     def test_unbuilt_layer_miss_is_a_gap_not_a_bug(self) -> None:
-        assert classify(StepExpectation("block", "", "provenance"), "allow") == "gap"
+        assert classify(StepExpectation("block", "", "policy"), "allow") == "gap"
 
     def test_own_layer_miss_is_a_mismatch(self) -> None:
         """A regression in a layer this build actually ships is not 'gap debt'."""
         assert classify(StepExpectation("block", "", "structural"), "allow") == "mismatch"
+
+    def test_the_layer_set_decides_gap_versus_mismatch(self) -> None:
+        """The same miss is a gap or a mismatch depending only on which layers
+        are running.
+
+        This is the load-bearing distinction in the whole evaluation, and it is
+        exactly the thing that breaks silently: if `classify` kept a hardcoded
+        list of known layers, then adding the provenance detector would have
+        filed its own failures as 'not built yet' and the gate would have stayed
+        green through four real misses.
+        """
+        step = StepExpectation("block", "", "provenance")
+        assert classify(step, "allow", ("structural",)) == "gap"
+        assert classify(step, "allow", ("structural", "provenance")) == "mismatch"
+
+    def test_every_layer_the_corpus_names_is_either_built_or_reported(
+        self, cases: list[Case]
+    ) -> None:
+        """No step may be attributed to a layer the evaluation cannot reason
+        about. An unrecognised layer name would be classified as a gap against
+        every configuration forever."""
+        assert {s["expect"].get("layer") for c in cases for s in c.trace} - {
+            None,
+            "structural",
+            "provenance",
+            "semantic",
+            "policy",
+        } == set()
 
 
 # -- metrics ----------------------------------------------------------------

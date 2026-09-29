@@ -193,7 +193,10 @@ def render(report: Report, *, title: str = "airlock evaluation") -> str:
         # `owned` is the subset this build is responsible for; gap steps are
         # excluded from both halves so a family with no owned steps reads 0/0
         # rather than a negative fraction.
-        owned_steps = [r for r in harmful if r.expected.layer in (None, "structural")]
+        # Ownership is read from the report's running-layer set, not restated
+        # here, so a newly added layer's wins show up in this table instead of
+        # being filed as gaps.
+        owned_steps = [r for r in harmful if report.owns(r.expected.layer)]
         gaps = len(harmful) - len(owned_steps)
         caught = sum(r.actual in ("block", "modify") for r in owned_steps)
         flagged_only = sum(r.actual == "flag" for r in owned_steps)
@@ -221,7 +224,7 @@ def render(report: Report, *, title: str = "airlock evaluation") -> str:
     gaps_by_layer: dict[str, list[StepResult]] = {}
     for result in attack_steps:
         layer = result.expected.layer
-        if layer and layer != "structural":
+        if layer and not report.owns(layer):
             gaps_by_layer.setdefault(layer, []).append(result)
 
     if gaps_by_layer:
@@ -260,9 +263,9 @@ def render(report: Report, *, title: str = "airlock evaluation") -> str:
     colour = "green" if report.is_clean() else "red"
     console.print(f"\n[{colour}bold]{verdict}[/{colour}bold]")
     console.print(
-        "[dim]PASS means: no false positives, and every step the structural "
-        "layer owns\nmatched the corpus. It does not mean the attacks were "
-        "stopped.[/dim]"
+        f"[dim]PASS means: no false positives, and every step owned by a layer "
+        f"in this build\n({' + '.join(report.layers) or 'none'}) matched the corpus. "
+        f"It does not mean the attacks were stopped.[/dim]"
     )
 
     return console.export_text()

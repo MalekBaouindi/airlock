@@ -34,7 +34,7 @@ from typing import Any, Literal
 
 from airlock.gateway.jsonrpc import Message
 from airlock.gateway.session import SessionContext
-from airlock.inspect.base import Inspector, InspectorPipeline
+from airlock.inspect.base import Inspector, InspectorPipeline, Resettable
 
 Verdict = Literal["allow", "flag", "modify", "block"]
 
@@ -116,6 +116,15 @@ class Case:
 @dataclass(slots=True)
 class Report:
     results: list[StepResult] = field(default_factory=list)
+    #: Names of the detector layers that were actually running. A step whose
+    #: accountable layer is missing from this set is a gap, not a regression --
+    #: but only because the set is derived from the pipeline rather than
+    #: hardcoded, so adding a layer cannot silently downgrade its failures.
+    layers: tuple[str, ...] = ("structural",)
+
+    def owns(self, layer: str | None) -> bool:
+        """Is a layer responsible for this step present in this build?"""
+        return layer is None or layer in self.layers
 
     # -- filtering ---------------------------------------------------------
 
@@ -168,16 +177,18 @@ class Report:
     def gap_rate(self) -> float:
         """Share of harmful steps attributed to a layer that does not exist yet."""
         steps = self.attack_steps()
-        gaps = sum(r.expected.layer is not None and r.expected.layer != "structural" for r in steps)
+        gaps = sum(not self.owns(r.expected.layer) for r in steps)
         return gaps / len(steps) if steps else 0.0
 
     # -- failure accounting ------------------------------------------------
 
     def regressions(self) -> list[StepResult]:
-        """Structural-layer steps that did not behave as specified."""
-        return [
-            r for r in self.results if r.expected.layer == "structural" and r.outcome != "match"
-        ]
+        """Steps a layer in this build is accountable for that went wrong.
+
+        False positives are excluded: they are their own category, and folding
+        them in here would make a report claim two regressions when only one is.
+        """
+        return [r for r in self.results if r.outcome == "mismatch" and self.owns(r.expected.layer)]
 
     def false_positives(self) -> list[StepResult]:
         return [r for r in self.results if r.outcome == "false-positive"]
@@ -299,25 +310,43 @@ def validate_corpus(cases: Sequence[Case]) -> list[str]:
 # -- replay -----------------------------------------------------------------
 
 
-def classify(expected: StepExpectation, actual: Verdict) -> str:
-    """Assign the three-valued outcome for one step."""
+def classify(
+    expected: StepExpectation,
+    actual: Verdict,
+    layers: Sequence[str] = ("structural",),
+) -> str:
+    """Assign the outcome for one step.
+
+    The distinction that carries the whole evaluation: a step no layer in this
+    build is accountable for is a *gap* -- still counted as a successful attack,
+    but not filed as a failure of code that is working as specified. Everything
+    else must match.
+    """
     if expected.verdict == "allow":
         return "match" if actual == "allow" else "false-positive"
     if actual == expected.verdict:
         return "match"
-    if expected.layer is not None and expected.layer != "structural":
+    if expected.layer is not None and expected.layer not in layers:
         return "gap"
     return "mismatch"
 
 
-def replay_case(case: Case, pipeline: InspectorPipeline) -> list[StepResult]:
+def replay_case(
+    case: Case,
+    pipeline: InspectorPipeline,
+    layers: Sequence[str] = ("structural",),
+) -> list[StepResult]:
     """Drive one transcript through the pipeline, step by step.
 
     State is per-case and fresh: a session context that leaked between cases
     would let one case's taint make the next case's verdict look better or
-    worse than it is.
+    worse than it is. That applies to the inspectors too -- a provenance layer
+    accumulates state by design, so it is reset here rather than shared.
     """
     ctx = SessionContext()
+    for inspector in pipeline.inspectors:
+        if isinstance(inspector, Resettable):
+            inspector.reset()
     results: list[StepResult] = []
     for index, step in enumerate(case.trace):
         expected = StepExpectation.from_json(step["expect"])
@@ -328,6 +357,10 @@ def replay_case(case: Case, pipeline: InspectorPipeline) -> list[StepResult]:
             ctx.note_request(message)
             verdict = pipeline.run_request(message, ctx)
         else:
+            # Mirror the relay: expose the correlation to detectors, then
+            # consume it. Replay has to see what the relay sees, or the
+            # evaluation would grade a pipeline the gateway never runs.
+            ctx.note_response(message)
             ctx.method_for_response(message)
             verdict = pipeline.run_response(message, ctx)
         nanos = time.perf_counter_ns() - started
@@ -343,7 +376,7 @@ def replay_case(case: Case, pipeline: InspectorPipeline) -> list[StepResult]:
                 expected=expected,
                 actual=actual,
                 rules=tuple(sorted({f.rule for f in verdict.findings})),
-                outcome=classify(expected, actual),  # type: ignore[arg-type]
+                outcome=classify(expected, actual, layers),  # type: ignore[arg-type]
                 nanos=nanos,
                 severity=case.severity,
             )
@@ -357,13 +390,20 @@ def replay(
     *,
     split: str | None = None,
 ) -> Report:
-    """Run every case through a pipeline built from `inspectors`."""
+    """Run every case through a pipeline built from `inspectors`.
+
+    The set of running layer names is recorded on the report and used to decide
+    what counts as a gap, so it is read off the pipeline instead of being
+    restated here. Otherwise adding a detector would leave its own failures
+    classified as "not built yet" and passing silently.
+    """
     pipeline = InspectorPipeline(tuple(inspectors))
-    report = Report()
+    layers = tuple(insp.name for insp in pipeline.inspectors)
+    report = Report(layers=layers)
     for case in cases:
         if split is not None and case.split != split:
             continue
-        report.results.extend(replay_case(case, pipeline))
+        report.results.extend(replay_case(case, pipeline, layers))
     return report
 
 

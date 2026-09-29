@@ -7,10 +7,11 @@ where untrusted content flows, and refuses to let it reach an egress sink — th
 to defeat itself and publishes the results.
 
 > **Status: early, and the numbers are small.** The interposition relay, the audit
-> chain, the structural detector, and the evaluation harness are implemented. The
-> provenance engine, policy engine, and local-LLM detector are not. The measured
-> attack success rate below is **87.5%** — the harness is honest about the fact that
-> one of the four layers it grades is shipping and three are not yet written.
+> chain, the structural detector, the provenance engine, and the evaluation harness
+> are implemented. The policy engine and the local-LLM detector are not. Held-out
+> attack success rate is **12.5%** at 0% false positives, with 6 of 6 owned steps
+> stopped — the residual is two `policy` steps, and the harness names them rather
+> than folding them into a rounder figure.
 
 ## Why
 
@@ -36,8 +37,8 @@ first-class result, alongside attack success.
 host  ──stdio──►  airlock  ──stdio──►  upstream MCP server
                      │
                      ├── structural detectors   (deterministic, offline, zero-cost)
-                     ├── provenance tracking    (taint across tool results)
-                     ├── policy engine          (fail-closed, sink-enumerated)
+                     ├── provenance tracking    (taint sources -> egress sinks)
+                     ├── policy engine          (not implemented yet)
                      └── audit log              (append-only, hash-chained)
 ```
 
@@ -67,10 +68,13 @@ uv sync --extra dev --extra integration   # + real MCP SDK, for the integration 
 
 ```bash
 # interpose on a server
+airlock proxy --provenance -- npx -y @modelcontextprotocol/server-filesystem /tmp
+
+# structural layer only (ablation: what does provenance add?)
 airlock proxy -- npx -y @modelcontextprotocol/server-filesystem /tmp
 
 # observe-only (measure detection without blocking anything)
-airlock proxy --block-at none -- npx -y @modelcontextprotocol/server-filesystem /tmp
+airlock proxy --provenance --block-at none -- npx -y @modelcontextprotocol/server-filesystem /tmp
 
 # inspect a session
 airlock replay .airlock/audit.jsonl --decisions block,flag
@@ -80,6 +84,19 @@ airlock verify .airlock/audit.jsonl
 ```
 
 ## Design notes
+
+**One response per request, even when the gateway answers.** The relay tracks
+outstanding requests so a dying upstream produces an error instead of an agent
+that waits forever. A blocked request is answered by the gateway and never
+reaches the upstream, so it has to leave that set — otherwise the sweep at
+shutdown treats it as unanswered and sends a *second* error for the same id.
+JSON-RPC has no way to express two responses to one request, and a client that
+already handled the first is now reading a reply it never asked for.
+
+**Findings never quote the value they matched.** The audit log is digest-only so
+that it does not become a plaintext archive of every secret the gateway saw. The
+leak to watch for is a human-readable detail string, so the reconstruction
+findings report *how much* of which source matched, not the matched text.
 
 **Untyped envelopes, on purpose.** The relay forwards any JSON-RPC method, including ones
 that do not exist in today's MCP specification. An attacker who can make the gateway drop
@@ -134,31 +151,85 @@ run regardless of what is under construction.
 ### Results
 
 Held-out `test` split, measured by `make eval`. `dev` is for iteration; the splits are
-disjoint and each contains steps the shipped layer owns.
+disjoint and each contains steps for every layer this build ships.
 
 | metric | value | 95% CI (bootstrap over cases) |
 |---|---|---|
-| attack success rate | 87.5% | [57.1%, 100.0%] |
-| weighted ASR | 81.0% | – |
-| detection rate | 12.5% | [0.0%, 42.9%] |
+| attack success rate | 12.5% | [0.0%, 42.9%] |
+| weighted ASR | 9.5% | – |
+| detection rate | 87.5% | [57.1%, 100.0%] |
 | false positive rate | 0.0% | 0/33 expected-allow steps |
 | control noise floor | 1 step | `benign-template-docs`, `template-token` |
 
-16 cases, 47 steps, 8 expected-harm. Structural layer: **1/1 owned step stopped**
-(invisible Unicode tag characters), 0 false positives, p50 8.3µs / p95 35.1µs
-inspection cost per step.
+16 cases, 47 steps, 8 expected-harm. p50 17.7µs / p95 63.2µs inspection cost per step.
 
-Read this honestly: **87.5% attack success is the real number.** The remaining seven
-misses are attributed to layers that do not exist yet — 6 to provenance (denial
-feedback, reframed instructions, sharded secrets, sleeper channels) and 1 to policy.
-The 12.5% detection rate is over a corpus deliberately built from attacks a lexical
-filter cannot see, and is not comparable to a vendor's headline figure.
+**6 of 6 owned steps stopped, 0 false positives.** The two remaining misses are both
+`policy`-layer steps — sending a workspace signing key to a host that is not the
+workspace, and creating a calendar event with attendees the transcript never
+introduced. That layer is not written yet, so those are reported as coverage debt.
 
-The control noise floor is tracked separately from the false-positive rate so a 0.0% FPR
-cannot be misread as "the detector was quiet everywhere". One step is flagged on
-purpose: a documentation page that literally contains chat-template tokens. Flagging it
-is correct — an analyst should see it. Blocking it would make documentation about chat
-templates unreadable, and the corpus grades the severity, not the silence.
+The `dev` split scores 13.0% ASR with 0% false positives and holds three more steps
+of unimplemented debt (`semantic` ×2, `policy` ×1), and both splits PASS. The gap
+between the splits is not overfitting — it is the corpus working. Three dev steps
+were regraded while building this layer, twice in the same direction: four steps
+claimed `provenance` credit for secrets that never entered the transcript
+(`<vault value>`, `<service account token>`), which taint tracking cannot catch by
+construction, and 24 drip steps demanded a block on a single character.
+
+Ablation, same split:
+
+| configuration | ASR | detection | FPR | owned recall |
+|---|---|---|---|---|
+| no detectors | 100.0% | 0.0% | 0.0% | – |
+| structural only | 87.5% | 12.5% | 0.0% | 1/1 |
+| provenance only | 25.0% | 75.0% | 0.0% | 5/5 |
+| both (shipped) | **12.5%** | 87.5% | 0.0% | **6/6** |
+
+Read the ablation rather than the headline. ASR stays high while any layer is missing,
+so on its own it cannot tell a layer that helps from one that does nothing; owned
+recall is the column that does that, and it is why the layers are constructed
+separately rather than fused into one detector.
+
+The provenance layer is the reason the number moved. It tracks four kinds of source —
+a read from a secret path, any tool result, **a denial**, and agent memory — and three
+ways material reaches a sink. Two of those are worth calling out because no per-message
+detector can express them:
+
+- **Denials are a taint source.** `EACCES: permission denied for /etc/shadow (file
+  exists)` returns no protected data, so flat taint tracking reports nothing — but the
+  existence of the file is precisely what is being laundered.
+- **Reconstruction is contiguous, and it fires mid-drip.** A secret posted one
+  character per request to rotating subdomains is reassembled across 24 messages.
+  Shuffled fragments do not reassemble, which is why the rule requires a
+  contiguous run rather than a character-class or entropy check. The prefix
+  variant matches the growing *suffix* of the outbound stream, so the block lands
+  on the 8th character rather than on whichever request completes the token — an
+  attacker picks between stopping before the threshold and being stopped before
+  finishing. Matching anywhere in the stream instead of at its end would be
+  simpler and wrong: one leak would make every later request in the session look
+  tainted.
+
+The false-positive boundary here is the one that decides whether any of this is
+deployable. `benign-egress` is structurally identical to the sleeper-channel case — a
+host read from a file becomes the request destination — and the only thing separating
+them is that `metrics.internal` sits under a reserved suffix and `partner-cdn.io` does
+not. A hostname an outside attacker cannot obtain is a real trust anchor; a naming
+convention is not, and this would not be a defensible rule without that difference.
+
+**Known limits, stated rather than buried.** Sharded reassembly needs 8 characters
+of a contiguous run, so a leak truncated below that is not detected. The corpus
+grades those first seven steps `allow` rather than pretending they are caught: a
+request carrying `t` is not evidence, and a gateway that blocked it would block
+all traffic. A compromised
+*internal* host is trusted by definition. And the `is_internal_host` test is a
+heuristic about the hostname, not a verification of the resolved address, so DNS
+rebinding defeats it.
+
+The control noise floor is tracked separately from the false-positive rate so a 0.0%
+FPR cannot be misread as "the detector was quiet everywhere". One step is flagged on
+purpose: a documentation page that literally contains chat-template tokens. Flagging
+it is correct — an analyst should see it. Blocking it would make documentation about
+chat templates unreadable, and the corpus grades the severity, not the silence.
 
 The corpus is small and hand-built, so the intervals are wide and the point estimates
 should be read as a working measurement, not a benchmark.
@@ -168,10 +239,12 @@ should be read as a working measurement, not a benchmark.
 ```
 src/airlock/
   gateway/     stdio relay, JSON-RPC envelopes, session correlation
-  inspect/     detectors (structural today; provenance, rules, local LLM next)
+  inspect/     structural detector, verdict combination
+  provenance/  taint sources, egress sinks, destination trust
+               (rollback on block, so one refused leak cannot poison a session)
   audit/       hash-chained log, chain verification
+  eval/        corpus replay, metrics, report generation
 corpus/        labelled transcripts + benign traffic
-eval/          harness, adaptive red team, report generation
 tests/         unit + integration (real MCP servers)
 ```
 

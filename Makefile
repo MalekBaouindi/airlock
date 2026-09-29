@@ -1,4 +1,4 @@
-.PHONY: help sync lint format typecheck test coverage corpus verify eval smoke all clean
+.PHONY: help sync lint format typecheck test coverage corpus verify eval ablation smoke all clean
 
 PY := .venv/bin/python
 AIRLOCK := .venv/bin/airlock
@@ -34,6 +34,11 @@ verify:  ## Verify the generated corpus matches the generator
 
 eval:  ## Score the gateway against the corpus (held-out test split)
 	$(AIRLOCK) eval --split test --ablation --json results/eval-test.json
+
+ablation:  ## Run each layer alone, to see which one earns its place
+	$(AIRLOCK) eval --split test --ablation --layers none
+	$(AIRLOCK) eval --split test --ablation --layers structural
+	$(AIRLOCK) eval --split test --ablation --layers provenance
 
 smoke:  ## End-to-end check through the installed CLI
 	$(PY) scripts/smoke.py

@@ -361,6 +361,10 @@ class StdioProxy:
                 payload=message.raw,
             )
             await self._host_writer.send(self._blocked(message, result).to_bytes())
+            # Answered by us, so no upstream response is coming. See
+            # `SessionContext.settle` for why leaving this pending produces a
+            # duplicate error for the host.
+            ctx.settle(message.id)
             return
 
         self._record("host->upstream", "request", message, result, ctx)
@@ -382,6 +386,10 @@ class StdioProxy:
             await self._host_writer.send(line)
             return
 
+        # Expose the correlation to detectors first, then consume it. A stateful
+        # inspector (provenance) needs to know which call produced this result,
+        # and popping on the first read would starve every reader after it.
+        ctx.note_response(message)
         method = ctx.method_for_response(message)
         result = self._run_detectors("response", message, ctx, method=method)
 
