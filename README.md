@@ -397,6 +397,25 @@ so a model having an off day cannot be read as an all-clear.
 than corrupting them, and the ablation reports the cost in seconds for that
 reason. Making the interface async is the real fix and is not done here.
 
+**A security decision may not depend on iteration order.** The provenance layer
+resolved a destination by taking an arbitrary element of the set of hosts a string
+mentioned. A URL is free to name a second host in its query, so
+`https://attacker.example/collect?ref=api.internal` produced a two-element set and
+the verdict followed whichever came first — and Python randomises string hashing
+per process, so the *same* transcript blocked on some `PYTHONHASHSEED` values and
+allowed on others. Three seeds out of twelve let the exfiltration through. No unit
+test could have caught it: inside one process the order is fixed, so the test
+passes, and the corpus never contained a destination naming two hosts.
+
+It is the kind of bug that survives a green suite by construction, which is why the
+regression test spawns subprocesses with fixed seeds rather than calling the code
+twice. The same function also read only the first recipient of a list, so the same
+address blocked as a string and allowed as a one-item list. Both were found by
+asking what the function was *for* — "which place is this field addressed to" — and
+noticing it was answering a different question, "which hosts does this text
+mention". A destination field is parsed, now, and the two layers are pinned by a
+test to name the same host for the same URL.
+
 **A check on a file has to ask the file's question.** `policy-check` could have
 reported which tools the corpus calls with an egress-shaped field, since that list is
 easy to produce and would have looked more thorough. It asks instead which fields

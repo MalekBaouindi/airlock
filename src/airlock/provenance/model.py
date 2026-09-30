@@ -145,14 +145,88 @@ def is_internal_host(host: str) -> bool:
 
 
 def hosts_in(text: str) -> set[str]:
-    """Every hostname a piece of untrusted text names."""
+    """Every hostname a piece of untrusted text names.
+
+    This is the *free text* question -- a tool result or a memory value can name
+    any number of hosts, and all of them are evidence. It is not the question to
+    ask about a destination field; see :func:`host_of_destination`.
+    """
     found: set[str] = set()
     for match in _URL.finditer(text):
         authority = match.group(1)
         host = authority.rsplit("@", 1)[-1]
-        found.add(host.rsplit(":", 1)[0] if host.count(":") == 1 else host)
+        # Lowercased like the other branch below. Without this a single
+        # mixed-case URL contributed two spellings of one host, and because the
+        # destination lookup lowercases its query, only the lowercase spelling
+        # could ever be found -- the other sat in the map forever, matching
+        # nothing, to be re-inserted by the next echo of the same URL.
+        found.add((host.rsplit(":", 1)[0] if host.count(":") == 1 else host).lower())
     found.update(m.group(0).lower() for m in _HOST.finditer(text))
     return {h for h in found if h}
+
+
+def host_of_destination(value: str) -> str:
+    """The single host a destination *field* is addressed to.
+
+    A destination field names one place to send data, and the question is which
+    place: the authority of the URL, or the domain of a bare address. It is not
+    "every host this string mentions", and conflating the two is a bypass in
+    both directions.
+
+    Too wide -- every host mentioned -- lets the caller choose the answer, since
+    a URL is free to name another host in its query:
+    ``https://attacker.example/collect?ref=api.internal`` is addressed to
+    ``attacker.example``, and a scan of the whole string returns both and lets
+    the second one win. It also made the verdict depend on set iteration order,
+    and Python randomises string hashing per process, so the *same* session
+    blocked on some runs and allowed on others. A gateway that decides by hash
+    seed is not a gateway.
+
+    Too narrow -- only a bare host -- misses a protocol-relative URL, a port, an
+    IPv6 literal and a bare recipient, each of which a deployment really uses.
+
+    Deliberately not case-folded past the ASCII host, and deliberately not
+    resolving anything: a name that looks internal is judged by
+    :func:`is_internal_host` downstream, on the string as written.
+    """
+    text = value.strip().lower()
+    if not text:
+        return ""
+
+    # A scheme, or the protocol-relative form, means the authority starts after
+    # `//`. Anything else is a bare host or a bare address, where the part before
+    # the first `/` is the whole thing.
+    if "://" in text:
+        text = text.split("://", 1)[1]
+    elif text.startswith("//"):
+        text = text[2:]
+
+    # Path, query and fragment are not part of the address. A fragment is cut
+    # before the userinfo `@` is resolved, or `host#@evil.example` would send
+    # the request to evil.example.
+    for separator in ("/", "?", "#"):
+        text = text.split(separator, 1)[0]
+    if not text:
+        return ""
+
+    if "@" in text:
+        # `https://user:pw@host` is a request to host, and a bare
+        # `someone@example.com` is a message to example.com. Both reduce to what
+        # follows the last `@`, which is the only reading that is right for each.
+        text = text.rsplit("@", 1)[1]
+    if not text:
+        return ""
+
+    if text.startswith("["):  # IPv6 literal: [::1]:8443
+        host, closing, _ = text.partition("]")
+        return host + "]" if closing else text
+    host, separator, port = text.partition(":")
+    if separator and port.isdigit():
+        return host
+    # A non-numeric port is malformed rather than a different host, and the whole
+    # string is returned so it matches no allowlist entry. Failing closed on a
+    # name that cannot resolve is the cheaper mistake.
+    return text
 
 
 def atoms_of(text: str) -> set[str]:
@@ -287,26 +361,33 @@ class TaintStore:
                 hosts.setdefault(host, source)
         return hosts
 
-    def forget_untrusted_hosts(self, owned: str) -> None:
+    def forget_untrusted_hosts(self, owned: str | Iterable[str]) -> None:
         """Stop blaming a host that a result merely echoed back.
 
-        `owned` is the destination the agent itself supplied in the request. A
-        server that reports what it did -- "200 OK https://api.example.net/x" --
-        puts that host into the agent's context, and the naive reading treats
-        the context as the place the host came from. But the agent typed the
-        host into the request; it did not learn it here. Marking it untrusted
-        makes the second ordinary call to that API a block, which is the most
-        common request pattern there is.
+        `owned` is what the agent itself named in the request. A server that
+        reports what it did -- "200 OK https://api.example.net/x" -- puts that
+        host into the agent's context, and the naive reading treats the context
+        as the place the host came from. But the agent typed the host into the
+        request; it did not learn it here. Marking it untrusted makes the second
+        ordinary call to that API a block, which is the most common request
+        pattern there is.
 
-        Only the host already attributed to a source that named it is touched,
-        so a result which echoes the requested URL *and* links somewhere else
-        still taints the other destination.
+        It is an iterable because a call can be addressed to several places at
+        once -- `to` is a list more often than a string -- and forgetting only
+        the first would leave the others to be blamed for an echo the agent
+        asked for.
+
+        Only a host already attributed to a source that named it is touched, so a
+        result which echoes the requested URL *and* links somewhere else still
+        taints the other destination.
         """
-        if not owned:
+        if isinstance(owned, str):
+            owned = [owned]
+        needles = {host.lower() for host in owned if host}
+        if not needles:
             return
-        needle = owned.lower()
         for source in self.sources:
-            if needle in source.hosts:
+            for needle in needles & source.hosts:
                 source.hosts.discard(needle)
 
     def record_outbound(self, payload: str) -> str:

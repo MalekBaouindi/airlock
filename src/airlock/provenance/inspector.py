@@ -43,7 +43,7 @@ from airlock.provenance.model import (
     SENSITIVE_PATH,
     EgressMatch,
     TaintStore,
-    hosts_in,
+    host_of_destination,
     strings_in,
 )
 
@@ -94,17 +94,27 @@ _MEMORY_WRITE = re.compile(r"(?i)memory[._]?(?:write|set|store|put)")
 _OWASP = "MCP10"
 
 
-def _destination_of(arguments: dict[str, Any]) -> str:
+def _destinations_of(arguments: dict[str, Any]) -> list[str]:
+    """Every destination the call is addressed to, in the order written.
+
+    All of them, because a recipient field is a list far more often than not and
+    the string-only version of this read one recipient out of several: the same
+    address blocked when it was the whole argument and allowed when it was one
+    entry of a list of two. An attacker picks the spelling, so a rule that reads
+    only one spelling is not a rule.
+    """
+    found: list[str] = []
     for key in DESTINATION_ARGUMENTS:
         value = arguments.get(key)
-        if isinstance(value, str) and value:
-            return value
-    return ""
+        if isinstance(value, str) and value.strip():
+            found.append(value)
+        elif isinstance(value, list):
+            found.extend(item for item in value if isinstance(item, str) and item.strip())
+    return found
 
 
 def _host_of(destination: str) -> str:
-    hosts = hosts_in(destination)
-    return next(iter(hosts), "")
+    return host_of_destination(destination)
 
 
 class ProvenanceInspector:
@@ -122,7 +132,7 @@ class ProvenanceInspector:
         self._inflight: dict[str, tuple[str, bool]] = {}
         #: Host each in-flight request asked to reach, so its response can be
         #: recognised as an echo rather than a source.
-        self._egress_targets: dict[str, str] = {}
+        self._egress_targets: dict[str, tuple[str, ...]] = {}
 
     @property
     def store(self) -> TaintStore:
@@ -164,7 +174,11 @@ class ProvenanceInspector:
             return verdict
         # Remember what the agent asked *for*, so the response leg can tell an
         # echo of its own request apart from a host it learned elsewhere.
-        self._egress_targets[key] = _host_of(_destination_of(arguments))
+        # Every host the agent itself chose, so the response leg can tell an echo
+        # of each one apart from a host the agent learned elsewhere.
+        self._egress_targets[key] = tuple(
+            host for host in map(_host_of, _destinations_of(arguments)) if host
+        )
         return verdict
 
     # -- response leg -------------------------------------------------------
@@ -173,17 +187,21 @@ class ProvenanceInspector:
         if ctx.inbound_method != "tools/call":
             return Verdict.allow()
         tool, sensitive = self._inflight.pop(str(message.id), ("", False))
-        destination = self._egress_targets.pop(str(message.id), "")
+        destinations = self._egress_targets.pop(str(message.id), ())
         if not tool:
             return Verdict.allow()
         if message.is_error:
             return self._record_denial(tool, message)
-        return self._record_result(tool, message, sensitive, destination)
+        return self._record_result(tool, message, sensitive, destinations)
 
     # -- sources ------------------------------------------------------------
 
     def _record_result(
-        self, tool: str, message: Message, sensitive: bool, destination: str = ""
+        self,
+        tool: str,
+        message: Message,
+        sensitive: bool,
+        destinations: tuple[str, ...] = (),
     ) -> Verdict:
         result = message.result if isinstance(message.result, dict) else {}
         text = "\n".join(strings_in(result))
@@ -201,8 +219,8 @@ class ProvenanceInspector:
         # so the second request to a host the agent chose normally gets blocked.
         # That is a false positive on the single most ordinary operation there
         # is: calling the same API twice.
-        if destination:
-            self._store.forget_untrusted_hosts(destination)
+        if destinations:
+            self._store.forget_untrusted_hosts(destinations)
         self._note_pointers(text)
         return Verdict.allow()
 
@@ -224,8 +242,8 @@ class ProvenanceInspector:
 
     def _check_sink(self, tool: str, arguments: dict[str, Any]) -> Verdict:
         payload = "\n".join(str(arguments[key]) for key in EGRESS_ARGUMENTS if key in arguments)
-        destination = _destination_of(arguments)
-        is_sink = bool(payload) and (bool(EGRESS_TOOLS.search(tool)) or destination != "")
+        hosts = [host for host in map(_host_of, _destinations_of(arguments)) if host]
+        is_sink = bool(payload) and (bool(EGRESS_TOOLS.search(tool)) or bool(hosts))
         if not is_sink:
             return Verdict.allow()
 
@@ -239,11 +257,13 @@ class ProvenanceInspector:
                 rebuilt = self._store.match_reconstruction(source)
                 if rebuilt is not None:
                     matches.append(rebuilt)
-        host = _host_of(destination)
-        if host:
+        # Every recipient is judged, and the first untrusted one is enough: the
+        # call goes to all of them, so one bad address taints the whole request.
+        for host in hosts:
             leak = self._store.match_destination(host)
             if leak is not None:
                 matches.append(leak)
+                break
 
         if not matches:
             return Verdict.allow()
