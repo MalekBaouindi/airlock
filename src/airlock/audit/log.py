@@ -183,6 +183,15 @@ class ChainVerification:
     records: int
     broken_at: int | None = None
     reason: str | None = None
+    #: The hash of the last record that verified. This is the chain's identity,
+    #: and it is the only part a *truncated* log still gets right, so it is what
+    #: an operator compares against anything outside the file.
+    head: str = GENESIS
+    #: The file ends in a partial record: a torn write, not an edit. Distinguished
+    #: from tampering because the honest diagnosis is data loss, and telling an
+    #: operator their log was tampered with when the disk ran out of space sends
+    #: them looking for an attacker instead of a disk.
+    truncated: bool = False
 
 
 def verify_chain(path: Path) -> ChainVerification:
@@ -191,6 +200,24 @@ def verify_chain(path: Path) -> ChainVerification:
     Detects the three tampering modes that matter: an edited record (hash
     mismatch), a deleted record (sequence or link mismatch), and a reordered
     pair (link mismatch).
+
+    It cannot detect a *clean* truncation, and that limit is worth being precise
+    about, because the naive reading of a hash chain is that it can. Every record
+    commits to the one before it, so a record removed from the end leaves the
+    records that remain as consistent as they ever were -- the chain verifies and
+    a leak is gone from the evidence. Deleting from the middle cannot work,
+    because the next record names the one that went missing.
+
+    This is why :attr:`ChainVerification.head` exists. Tail deletion is
+    undetectable by anything inside the file, so the end of the chain has to be
+    compared against something that is not the file: a line count from the log
+    pipeline, a SIEM copy, the ticket where the incident was filed. A verifier
+    that can only answer "is this internally consistent" should hand back the
+    number you would compare, not a bare yes.
+
+    A torn final line is the one form of tail loss that *is* visible: a complete
+    write includes its newline, so a record that does not parse and has no
+    terminator is a write that was cut short.
     """
     prev = GENESIS
     count = 0
@@ -198,7 +225,23 @@ def verify_chain(path: Path) -> ChainVerification:
         for line in handle:
             if not line.strip():
                 continue
-            raw = json.loads(line)
+            try:
+                raw = json.loads(line)
+            except json.JSONDecodeError as exc:
+                if not line.endswith(b"\n"):
+                    return ChainVerification(
+                        True,
+                        count,
+                        reason=f"final record is a partial write ({exc.msg})",
+                        head=prev,
+                        truncated=True,
+                    )
+                # A line that ended cleanly and still does not parse is not a torn
+                # write. It is corruption or an edit in the middle of the file, and
+                # it is not this function's job to be charitable about which.
+                return ChainVerification(
+                    False, count, None, f"unparseable record: {exc.msg}", head=prev
+                )
             findings = [Finding(**f) for f in raw.get("findings", [])]
             record = AuditRecord(
                 seq=raw["seq"],
@@ -218,20 +261,37 @@ def verify_chain(path: Path) -> ChainVerification:
             )
             if record.prev_hash != prev:
                 return ChainVerification(
-                    False, count, record.seq, f"broken link at record {record.seq}"
+                    False, count, record.seq, f"broken link at record {record.seq}", head=prev
                 )
             if record.compute_hash() != record.hash:
                 return ChainVerification(
-                    False, count, record.seq, f"content hash mismatch at record {record.seq}"
+                    False,
+                    count,
+                    record.seq,
+                    f"content hash mismatch at record {record.seq}",
+                    head=prev,
                 )
             prev = record.hash
             count += 1
-    return ChainVerification(True, count)
+    return ChainVerification(True, count, head=prev)
 
 
 def iter_records(path: Path) -> Iterator[dict[str, Any]]:
-    """Yield raw audit records for replay and report generation."""
+    """Yield raw audit records for replay and report generation.
+
+    A torn final line stops the iteration rather than raising. Replay is a reader
+    and the record is already gone, so raising would turn a partial log into an
+    unreadable one. Interior corruption still raises: that is not a torn write, and
+    quietly skipping it during an incident review would hide exactly the kind of
+    edit an operator is looking for.
+    """
     with Path(path).open("rb") as handle:
         for line in handle:
-            if line.strip():
+            if not line.strip():
+                continue
+            try:
                 yield json.loads(line)
+            except json.JSONDecodeError:
+                if not line.endswith(b"\n"):
+                    return
+                raise

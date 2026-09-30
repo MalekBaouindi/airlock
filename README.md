@@ -322,7 +322,9 @@ airlock proxy --provenance --block-at none -- npx -y @modelcontextprotocol/serve
 # inspect a session
 airlock replay .airlock/audit.jsonl --decisions block,flag
 
-# confirm the audit trail has not been altered
+# confirm the audit trail has not been altered; prints the chain head to compare
+# against the log pipeline's own record count, because a clean tail deletion is
+# indistinguishable from a log that ended on its own
 airlock verify .airlock/audit.jsonl
 
 # is the policy file still deciding what the traffic actually does?
@@ -460,10 +462,18 @@ queries are judged separately, by the identifiers they name. A false positive th
 records a source, while a false negative is a silent leak, so the threshold leans towards
 treating a query as sensitive.
 
-**The audit log is tamper-evident.** Records are hash-chained; deleting, editing or
-reordering any record invalidates every record after it. Payload capture defaults to
-digest-only, because a security tool whose logs become a plaintext archive of agent
-traffic is its own vulnerability.
+**A hash chain cannot see its own tail.** Records are hash-chained, so editing a record,
+deleting one from the middle, or reordering two of them invalidates every record after it.
+Deleting records from the *end* does not, and this is the limit of the primitive rather
+than a gap in the implementation: each record commits to the one before it, so the
+survivors are exactly as consistent as they ever were and the leak has left no gap to
+find. So `airlock verify` does not stop at a verdict — it prints the chain head, the one
+number that a shorter log cannot fake, to be compared against a line count from the log
+pipeline or a SIEM copy. A record that was half-written when the process died is the one
+tail loss the log itself can see, and it is reported as `TRUNCATED` with exit code `2`,
+separately from tampering, because the useful next step is different in each case. Payload
+capture defaults to digest-only, because a security tool whose logs become a plaintext
+archive of agent traffic is its own vulnerability.
 
 ## Evaluation
 

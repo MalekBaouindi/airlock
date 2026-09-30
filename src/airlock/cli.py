@@ -445,8 +445,30 @@ def cmd_verify(argv: Sequence[str]) -> int:
         return 1
 
     result = verify_chain(args.audit)
+    if result.truncated:
+        # Exit 2, distinct from tampering, because the response is different: a
+        # torn record is a disk that ran out of room or a process that was killed
+        # mid-write, and an operator told "tampered" goes looking for a person
+        # instead of a filesystem.
+        print(
+            f"TRUNCATED: {result.reason}\n"
+            f"  {result.records} record(s) verified, last good record:\n"
+            f"  {result.head}\n"
+            f"  compare that head with the log pipeline's record count: a shorter log"
+            f" than you expect is a tail nobody can detect from inside the file.",
+            file=sys.stderr,
+        )
+        return 2
     if result.ok:
         print(f"ok: {result.records} record(s), chain intact")
+        print(f"head: {result.head}")
+        print(
+            "  the chain proves nothing was edited, moved or removed from the "
+            "middle.\n"
+            "  it cannot prove nothing was removed from the end, which looks "
+            "identical.\n"
+            "  compare the head against the record count your log pipeline kept."
+        )
         return 0
     print(
         f"TAMPERED: {result.reason} (verified up to {result.records} record(s))",

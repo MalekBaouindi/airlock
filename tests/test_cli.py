@@ -128,6 +128,32 @@ class TestVerify:
         assert main(["verify", str(tmp_path / "nope.jsonl")]) == 1
         assert "no such audit log" in capsys.readouterr().err
 
+    def test_intact_chain_prints_the_head_to_compare_outside(
+        self, log_with_session: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # "Intact" on its own is not a claim the chain can support, so the command
+        # has to hand back the number an operator can actually check against
+        # something outside the file.
+        assert main(["verify", str(log_with_session)]) == 0
+        out = capsys.readouterr().out
+        assert f"head: {verify_chain(log_with_session).head}" in out
+        assert "removed from the end" in out
+
+    def test_a_torn_final_record_exits_two_not_one(
+        self, log_with_session: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # 1 means something was edited. 2 means the log stopped early. The
+        # responses are different -- look for an edit, or look for a full disk --
+        # and a monitor can act on the difference.
+        log_with_session.write_text(
+            log_with_session.read_text() + '{"seq": 99, "ts": 1, "sessi'
+        )
+        assert main(["verify", str(log_with_session)]) == 2
+        err = capsys.readouterr().err
+        assert "TRUNCATED" in err
+        assert "partial write" in err
+        assert "TAMPERED" not in err
+
 
 class TestReplay:
     def test_renders_all_records(
