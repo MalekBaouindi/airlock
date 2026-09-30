@@ -267,10 +267,13 @@ def render(report: Report, *, title: str = "airlock evaluation") -> str:
     verdict = "PASS" if report.is_clean() else "FAIL"
     colour = "green" if report.is_clean() else "red"
     console.print(f"\n[{colour}bold]{verdict}[/{colour}bold]")
+    # "A passing run means", not "PASS means": the definition is printed on every
+    # report, including failing ones, and a document that spells the bare token
+    # either way makes `airlock eval | grep PASS` agree with a build that failed.
     console.print(
-        f"[dim]PASS means: no false positives, and every step owned by a layer "
-        f"in this build\n({' + '.join(report.layers) or 'none'}) matched the corpus. "
-        f"It does not mean the attacks were stopped.[/dim]"
+        f"[dim]A passing run means: no false positives, and every step owned by "
+        f"a layer in this build\n({' + '.join(report.layers) or 'none'}) matched the "
+        f"corpus. It does not mean the attacks were stopped.[/dim]"
     )
 
     return console.export_text()
