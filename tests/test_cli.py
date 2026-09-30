@@ -201,3 +201,166 @@ class TestChainIntegrityAfterCLIUse:
     def test_verify_agrees_with_library(self, log_with_session: Path) -> None:
         assert verify_chain(log_with_session).ok
         assert main(["verify", str(log_with_session)]) == 0
+
+
+class TestEvalJsonAgreesWithTheTable:
+    """`--json` and the rendered table come from one set of definitions.
+
+    The JSON block used to grade families with its own rule -- "any layer other
+    than structural owns this step" -- while the table asked the report whether
+    the layer was actually running. On a full run they disagreed about 7 of 12
+    families, and the JSON was wrong in the direction that flatters: gaps reported
+    where the table had none, and `stopped: 0` next to families the table had
+    caught two steps of. A dashboard reading that would have reported a project
+    that caught nothing and had outstanding coverage debt, from a run that caught
+    everything and had none.
+    """
+
+    POLICY = "examples/corpus-workspace-policy.json"
+
+    @pytest.mark.parametrize("layers", ["all", "provenance", "policy", "structural", "none"])
+    def test_per_family_matches_the_shared_grade(self, tmp_path: Path, layers: str) -> None:
+        out = tmp_path / "report.json"
+        assert main(
+            ["eval", "--split", "test", "--layers", layers, "--policy", self.POLICY,
+             "--json", str(out)]
+        ) == 0
+        payload = json.loads(out.read_text())
+
+        from airlock.cli import _load_policy, build_layers
+        from airlock.eval.harness import load_corpus, replay
+
+        report = replay(
+            load_corpus(Path(__file__).resolve().parents[1] / "corpus"),
+            build_layers(layers, _load_policy(self.POLICY)),
+            split="test",
+        )
+        stats = report.family_stats()
+        assert set(payload["per_family"]) == set(stats)
+        for family, got in payload["per_family"].items():
+            assert got == stats[family].as_json(), family
+
+    def test_the_headline_numbers_match_the_report(self, tmp_path: Path) -> None:
+        out = tmp_path / "report.json"
+        main(["eval", "--split", "test", "--policy", self.POLICY, "--json", str(out)])
+        payload = json.loads(out.read_text())
+
+        from airlock.cli import _load_policy, build_layers
+        from airlock.eval.harness import load_corpus, replay
+
+        report = replay(
+            load_corpus(Path(__file__).resolve().parents[1] / "corpus"),
+            build_layers("all", _load_policy(self.POLICY)),
+            split="test",
+        )
+        assert payload["attack_success_rate"] == report.attack_success_rate()
+        assert payload["weighted_attack_success_rate"] == report.weighted_attack_success_rate()
+        assert payload["detection_rate"] == report.detection_rate()
+        assert payload["false_positive_rate"] == report.false_positive_rate()
+        assert payload["clean"] is report.is_clean()
+
+    def test_missing_parent_directories_are_created(self, tmp_path: Path) -> None:
+        out = tmp_path / "deep" / "nested" / "report.json"
+        assert main(["eval", "--split", "test", "--policy", self.POLICY, "--json", str(out)]) == 0
+        assert json.loads(out.read_text())["clean"] is True
+
+
+class TestProxyLayersMatchWhatEvalMeasures:
+    """The proxy and `eval` must be able to reach the same configuration.
+
+    This is the invariant the code comments keep asserting and nothing was
+    holding: `build_layers("all")` builds structural + provenance + policy, and
+    the documented deployment invocation has to reach the same set, in the same
+    order -- the first `modify` wins the replacement, so order is load-bearing.
+    A layer that appears in one command and not the other is how a published
+    number stops describing the thing it was measured on.
+    """
+
+    POLICY = "examples/corpus-workspace-policy.json"
+
+    def _layers(self, **overrides: object) -> list[str]:
+        from airlock.cli import _load_policy, build_proxy_layers
+
+        kwargs: dict[str, object] = {
+            "no_structural": False,
+            "block_at": "critical",
+            "provenance": True,
+            "semantic": False,
+            "policy": _load_policy(self.POLICY),
+        }
+        kwargs.update(overrides)
+        return [i.name for i in build_proxy_layers(**kwargs)]  # type: ignore[arg-type]
+
+    def test_the_documented_invocation_is_the_configuration_eval_measures(self) -> None:
+        from airlock.cli import _load_policy, build_layers
+
+        assert self._layers() == [i.name for i in build_layers("all", _load_policy(self.POLICY))]
+
+    def test_provenance_is_opt_in_and_that_is_documented_as_an_ablation(self) -> None:
+        assert self._layers(provenance=False) == ["structural", "policy"]
+
+    def test_the_proxy_flags_enumerate_sets_no_single_layers_value_reaches(self) -> None:
+        """Worth knowing rather than fixing.
+
+        `--layers structural` means exactly structural and drops the policy
+        layer, which is what makes it an ablation. The proxy keeps the policy
+        layer whenever a file resolves and has no way to switch provenance off
+        and the policy off at once. So `proxy --policy p` (structural+policy)
+        is a configuration `eval` cannot be asked for by name, and someone
+        reproducing a proxy run in `eval` has to know that.
+
+        The alternative -- making `--layers structural` include the policy layer
+        whenever one is loaded -- would make the ablation table measure two
+        layers while labelling it one, so the sets stay as they are and the
+        `--layers` help says which reading it takes.
+        """
+        from airlock.cli import _load_policy, build_layers
+
+        policy = _load_policy(self.POLICY)
+        # `semantic` is left out: building it needs a model server, and it is
+        # never a policy layer, so it cannot make structural+policy reachable.
+        reachable = {
+            tuple(i.name for i in build_layers(choice, policy))
+            for choice in ("all", "structural", "provenance", "policy", "none")
+        }
+        assert ("structural", "policy") not in reachable
+
+    def test_no_policy_means_no_policy_layer(self) -> None:
+        assert self._layers(policy=None) == ["structural", "provenance"]
+
+    def test_structural_can_be_switched_off(self) -> None:
+        assert self._layers(no_structural=True) == ["provenance", "policy"]
+
+    def test_observe_only_keeps_the_layer_and_relaxes_the_threshold(self) -> None:
+        """`--block-at none` measures detection without stopping anything.
+
+        The layer has to stay: observe-only with no detectors would report a
+        quiet session rather than a decision to watch, which is the number this
+        mode exists to collect.
+        """
+        assert self._layers(block_at="none") == ["structural", "provenance", "policy"]
+
+    def test_an_unknown_severity_is_refused_rather_than_silently_mismatched(self) -> None:
+        from airlock.cli import build_proxy_layers
+
+        with pytest.raises(ValueError, match="unknown severity"):
+            build_proxy_layers(
+                no_structural=False,
+                block_at="criticalish",
+                provenance=False,
+                semantic=False,
+                policy=None,
+            )
+
+    def test_the_structural_threshold_is_the_one_that_was_asked_for(self) -> None:
+        from airlock.cli import build_proxy_layers
+
+        for level in ("info", "low", "medium", "high", "critical"):
+            [inspector] = build_proxy_layers(
+                no_structural=False,
+                block_at=level,
+                provenance=False,
+                semantic=False,
+                policy=None,
+            )
+            assert inspector.block_at == level

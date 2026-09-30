@@ -17,6 +17,7 @@ import os
 import sys
 from collections.abc import Sequence
 from pathlib import Path
+from typing import cast
 
 from airlock import __version__
 from airlock.audit.log import AuditLog, iter_records, verify_chain
@@ -24,7 +25,7 @@ from airlock.gateway.stdio_proxy import StdioProxy, UpstreamSpec
 from airlock.inspect.base import Inspector, InspectorPipeline
 from airlock.inspect.policy import Policy, PolicyError, PolicyInspector
 from airlock.inspect.semantic import SemanticInspector
-from airlock.inspect.structural import StructuralInspector
+from airlock.inspect.structural import SEVERITY_RANK, Severity, StructuralInspector
 from airlock.llm.client import LocalModel
 from airlock.provenance.inspector import ProvenanceInspector
 
@@ -102,6 +103,62 @@ def _load_policy(explicit: str | None) -> Policy | None:
         return Policy.load(path)
     except PolicyError as exc:
         raise SystemExit(f"error: {exc}") from exc
+
+
+class JudgeUnavailable(RuntimeError):
+    """`--semantic` was asked for and nothing is serving the model."""
+
+
+def build_proxy_layers(
+    *,
+    no_structural: bool,
+    block_at: Severity | str | None,
+    provenance: bool,
+    semantic: bool,
+    policy: Policy | None,
+    judge_endpoint: str | None = None,
+) -> list[Inspector]:
+    """The layers a proxy invocation runs, in the order it applies them.
+
+    Factored out of `cmd_proxy` so a test can ask which layers an invocation
+    produces and compare it against what `eval` measures under the same
+    configuration. The two disagreeing is exactly how a published number stops
+    describing the thing it was measured on: `eval --layers all` builds
+    structural + provenance + policy, and the documented deployment invocation
+    has to be reachable to the same set. Order is shared too, because the first
+    `modify` wins the replacement.
+
+    Note what is *not* here: provenance stays opt-in on the command line, so
+    `airlock proxy -- <server>` is the structural-only ablation. That is
+    deliberate and every documented deployment passes `--provenance`; the
+    invariant is that the flag reaches the same layer set `eval` measures, not
+    that it is on by default.
+    """
+    inspectors: list[Inspector] = []
+    if not no_structural:
+        # `Severity` is a Literal, so the value arriving from argparse is only
+        # trustworthy because the parser restricted it. Check rather than cast:
+        # this function is callable from anywhere, and a mistyped severity would
+        # otherwise mean a threshold that silently never matches.
+        level = cast("Severity | None", None if block_at in ("none", None) else block_at)
+        if level is not None and level not in SEVERITY_RANK:
+            raise ValueError(f"unknown severity {block_at!r}; expected one of {tuple(SEVERITY_RANK)}")
+        inspectors.append(StructuralInspector(block_at=level))
+    if provenance:
+        inspectors.append(ProvenanceInspector())
+    if policy is not None:
+        inspectors.append(PolicyInspector(policy))
+    if semantic:
+        judge = LocalModel.from_env()
+        if judge_endpoint:
+            judge.endpoint = judge_endpoint
+        if not judge.available():
+            # Refuse to build rather than build without the layer. A gateway
+            # asked for a judge and silently given no judge is a gateway
+            # reporting protection it does not have.
+            raise JudgeUnavailable(judge.describe())
+        inspectors.append(SemanticInspector(model=judge))
+    return inspectors
 
 
 def build_proxy_parser() -> argparse.ArgumentParser:
@@ -190,30 +247,23 @@ def cmd_proxy(argv: Sequence[str]) -> int:
 
     args = build_proxy_parser().parse_args(our_args)
 
-    inspectors: list[Inspector] = []
-    if not args.no_structural:
-        block_at = None if args.block_at == "none" else args.block_at
-        inspectors.append(StructuralInspector(block_at=block_at))
-    if args.provenance:
-        inspectors.append(ProvenanceInspector())
     policy = _load_policy(str(args.policy) if args.policy else None)
-    if policy is not None:
-        inspectors.append(PolicyInspector(policy))
-    if args.semantic:
-        judge = LocalModel.from_env()
-        if args.judge_endpoint:
-            judge.endpoint = args.judge_endpoint
-        if not judge.available():
-            # Refuse to start rather than start without the layer. A gateway
-            # asked for a judge and silently given no judge is a gateway
-            # reporting protection it does not have.
-            print(
-                f"error: --semantic needs a model server; {judge.describe()} "
-                "is not answering. Start it, or pass --judge-endpoint.",
-                file=sys.stderr,
-            )
-            return 2
-        inspectors.append(SemanticInspector(model=judge))
+    try:
+        inspectors = build_proxy_layers(
+            no_structural=args.no_structural,
+            block_at=args.block_at,
+            provenance=args.provenance,
+            semantic=args.semantic,
+            policy=policy,
+            judge_endpoint=args.judge_endpoint,
+        )
+    except JudgeUnavailable as exc:
+        print(
+            f"error: --semantic needs a model server; {exc} "
+            "is not answering. Start it, or pass --judge-endpoint.",
+            file=sys.stderr,
+        )
+        return 2
 
     pipeline = InspectorPipeline(inspectors=inspectors)
     audit = AuditLog(args.audit, capture=args.capture)
@@ -430,7 +480,7 @@ def cmd_policy_check(argv: Sequence[str]) -> int:
     # An empty table is worse than no table: a header over zero rows reads like
     # the tool found nothing at all, when it found three decided fields.
     if shown:
-            # Long titles wrap onto three lines in a narrow terminal and push the table
+        # Long titles wrap onto three lines in a narrow terminal and push the table
         # off the screen, so the split is named and the file is not.
         title = f"airlock policy-check - {args.split or 'dev+test'} split(s)"
         table = Table(title=title, show_lines=False, expand=False)
@@ -579,6 +629,12 @@ def cmd_eval(argv: Sequence[str]) -> int:
         "--layers",
         default="all",
         choices=("all", "structural", "provenance", "policy", "semantic", "none"),
+        # A named layer means *exactly* that layer, even when a policy file is
+        # loaded: `--layers structural --policy p.json` does not add the policy
+        # layer, which is what makes it an ablation. The proxy has no equivalent
+        # flag -- it keeps the policy layer whenever a file resolves -- so this
+        # option and the proxy's flags do not enumerate the same sets. Read
+        # `--layers` as "measure precisely this", not "whatever is configured".
         help="which detector layers to run (default: all)",
     )
     parser.add_argument(
@@ -754,20 +810,13 @@ def cmd_eval(argv: Sequence[str]) -> int:
                 for r in report.results
                 if r.outcome in ("false-positive", "mismatch")
             ],
+            # The same numbers the table above prints. This block used to
+            # hardcode `structural` as the only layer that could own a step,
+            # so it reported gaps the table did not and `stopped: 0` beside
+            # families the table had caught.
             "per_family": {
-                family: {
-                    "steps": len(results),
-                    "stopped": sum(
-                        r.actual in ("block", "modify")
-                        and not (r.expected.layer and r.expected.layer != "structural")
-                        for r in results
-                    ),
-                    "gaps": sum(
-                        r.expected.layer is not None and r.expected.layer != "structural"
-                        for r in results
-                    ),
-                }
-                for family, results in sorted(report.by_family().items())
+                family: stats.as_json()
+                for family, stats in sorted(report.family_stats().items())
             },
         }
         args.json.parent.mkdir(parents=True, exist_ok=True)

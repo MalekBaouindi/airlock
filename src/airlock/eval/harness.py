@@ -119,6 +119,53 @@ class Case:
     trace: tuple[dict[str, Any], ...]
 
 
+@dataclass(frozen=True, slots=True)
+class FamilyStats:
+    """One row of the per-family table, and the JSON object that mirrors it.
+
+    Two definitions of "gap" lived side by side for most of the project's life:
+    one in the renderer, one inlined in the `--json` payload, which assumed
+    `structural` was the only layer that could ever own a step. On a full run they
+    disagreed about 7 of 12 families, and the JSON was wrong in the flattering
+    direction -- it reported gaps where there were none, and `stopped: 0` beside
+    families the table had caught two steps of. Both read this now, so a dashboard
+    and a human reading the same run cannot be told two different stories.
+
+    `owned` means "this build has the layer that was supposed to produce this
+    verdict". `gaps` are the harmful steps with no owner: counted as successful
+    attacks, never as detector bugs. Detection is graded apart from the
+    block/modify scale, because flagging everything scores 100% there.
+    """
+
+    family: str
+    kind: str
+    steps: int
+    harmful: int
+    owned: int
+    stopped: int
+    flagged_only: int
+    gaps: int
+    detection: int
+    detected: int
+
+    @property
+    def recall(self) -> float:
+        """Stopped over owned. Zero when nothing is owned, not a division."""
+        return self.stopped / self.owned if self.owned else 0.0
+
+    def as_json(self) -> dict[str, int]:
+        return {
+            "steps": self.steps,
+            "harmful": self.harmful,
+            "owned": self.owned,
+            "stopped": self.stopped,
+            "flag_only": self.flagged_only,
+            "gaps": self.gaps,
+            "detection": self.detection,
+            "detected": self.detected,
+        }
+
+
 @dataclass(slots=True)
 class Report:
     results: list[StepResult] = field(default_factory=list)
@@ -133,6 +180,31 @@ class Report:
         return layer is None or layer in self.layers
 
     # -- filtering ---------------------------------------------------------
+
+    def family_stats(self) -> dict[str, FamilyStats]:
+        """Per-family counts, graded identically for every consumer.
+
+        Shared by the rendered table and the `--json` payload, so the two cannot
+        drift apart again the moment a third layer is added.
+        """
+        stats: dict[str, FamilyStats] = {}
+        for family, results in self.by_family().items():
+            harmful = [r for r in results if r.expected.verdict in MITIGATING]
+            detection = [r for r in results if r.expected.verdict == "flag"]
+            owned = [r for r in harmful if self.owns(r.expected.layer)]
+            stats[family] = FamilyStats(
+                family=family,
+                kind=results[0].kind,
+                steps=len(results),
+                harmful=len(harmful),
+                owned=len(owned),
+                stopped=sum(r.actual in MITIGATING for r in owned),
+                flagged_only=sum(r.actual == "flag" for r in owned),
+                gaps=len(harmful) - len(owned),
+                detection=len(detection),
+                detected=sum(r.actual in MITIGATING for r in detection),
+            )
+        return stats
 
     def by_family(self) -> dict[str, list[StepResult]]:
         grouped: dict[str, list[StepResult]] = defaultdict(list)

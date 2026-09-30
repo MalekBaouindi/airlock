@@ -167,23 +167,22 @@ def render(report: Report, *, title: str = "airlock evaluation") -> str:
     # -- per family --------------------------------------------------------
 
     rows: list[list[str]] = []
-    for family, results in sorted(report.by_family().items()):
-        harmful = [r for r in results if r.expected.verdict in ("block", "modify")]
-        detection = [r for r in results if r.expected.verdict == "flag"]
-        kind = results[0].kind
-        if not harmful:
+    for _, stats in sorted(report.family_stats().items()):
+        if not stats.harmful:
             # A family whose only non-allow steps are `flag` may still be an
             # attack family, so the kind comes from the corpus rather than from
             # the verdicts -- inferring it would let a mislabelled case quietly
             # reclassify itself as a control.
-            caught = sum(r.actual in ("block", "modify") for r in detection)
             rows.append(
                 [
-                    family,
-                    kind,
-                    f"{len(results)}",
-                    f"{caught}/{len(detection)}" if detection else "-",
-                    _bar(caught / len(detection) if detection else 0.0, 10),
+                    stats.family,
+                    stats.kind,
+                    f"{stats.steps}",
+                    f"{stats.detected}/{stats.detection}" if stats.detection else "-",
+                    _bar(
+                        stats.detected / stats.detection if stats.detection else 0.0,
+                        10,
+                    ),
                     "-",
                     "-",
                 ]
@@ -193,22 +192,15 @@ def render(report: Report, *, title: str = "airlock evaluation") -> str:
         # `owned` is the subset this build is responsible for; gap steps are
         # excluded from both halves so a family with no owned steps reads 0/0
         # rather than a negative fraction.
-        # Ownership is read from the report's running-layer set, not restated
-        # here, so a newly added layer's wins show up in this table instead of
-        # being filed as gaps.
-        owned_steps = [r for r in harmful if report.owns(r.expected.layer)]
-        gaps = len(harmful) - len(owned_steps)
-        caught = sum(r.actual in ("block", "modify") for r in owned_steps)
-        flagged_only = sum(r.actual == "flag" for r in owned_steps)
         rows.append(
             [
-                family,
-                kind,
-                f"{len(results)}",
-                f"{caught}/{len(owned_steps)}",
-                _bar(caught / len(owned_steps) if owned_steps else 0.0, 10),
-                f"{flagged_only}",
-                f"{gaps}/{len(harmful)}",
+                stats.family,
+                stats.kind,
+                f"{stats.steps}",
+                f"{stats.stopped}/{stats.owned}",
+                _bar(stats.recall, 10),
+                f"{stats.flagged_only}",
+                f"{stats.gaps}/{stats.harmful}",
             ]
         )
 
