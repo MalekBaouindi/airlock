@@ -233,6 +233,53 @@ that it is covered.
 It found one real gap in the example file it shipped with, on the first run:
 `web_fetch.url`, which is now an explicit `anywhere` with the reasoning above.
 
+### Asking the server instead of guessing
+
+That last limit is not a caveat, it is a design flaw with one honest way out. The
+checker reads its vocabulary of field names out of the corpus, so the corpus chose the
+vocabulary — and a server free to call an argument `target` hands the policy layer a
+field nobody looked at. A field nobody looked at is not a field that was found safe; it
+is the same shape as the provenance bug where the verdict depended on the hash seed.
+
+So there is a second command that goes and asks:
+
+```
+$ airlock discover --policy workspace.json -- npx -y @scope/server-fetch
+sync_artifact 1.4.0 (protocol 2025-06-18)
+
+  fetch_url
+    Fetches a URL.
+   ~ url: string
+
+  sync_artifact
+    Pushes an artifact somewhere.
+     artifact: string
+   ~ target: string
+     options: object
+   ~ options.url: string
+     options.retries: integer
+
+2 argument(s) this policy does not govern:
+   ~ sync_artifact.target
+   ~ sync_artifact.options.url
+```
+
+It runs the server, completes the handshake, follows the `tools/list` cursor to the
+last page and reports what the server says it accepts. `target` is in
+`RECIPIENT_ARGUMENTS` nowhere and in no enforced list — the corpus could not have found
+it, and a policy written from the corpus cannot govern it. Exit code is `1` when a
+conventional destination name is ungoverned, so it works as a CI step against a pinned
+server.
+
+Three things it deliberately will not claim. **A schema cannot say what a field
+carries**: `target` may hold a webhook, a shard, or a colour, so `~` is a reading aid
+and every argument is listed, not only the flagged ones, because a field with an
+ordinary name can still point somewhere. **It is not enforcement**: the proxy stays a
+pure relay, still decides only what the file says, and nothing discovered here can move
+a verdict — this is an operator reading a surface before writing a policy. **It sees one
+server**: a server that never answers `tools/list`, or that writes a banner to the
+stdout wire, is reported as unseen rather than guessed at from tool names.
+
 ## The local judge
 
 The semantic layer needs a model server. It is not a dependency of the project:
@@ -329,6 +376,9 @@ airlock verify .airlock/audit.jsonl
 
 # is the policy file still deciding what the traffic actually does?
 airlock policy-check --policy examples/corpus-workspace-policy.json
+
+# ask a server what it accepts, rather than inferring it from the corpus
+airlock discover --policy workspace.json -- npx -y @scope/server-fetch
 ```
 
 ## Design notes
@@ -427,6 +477,18 @@ use it. An earlier version read provenance's narrower host-extracting list and w
 blind to `attendees` — the one surface with no host to extract, and the one the layer
 was built for. A check that cannot fail on the bug it was written for is worse than
 no check, because it gets trusted.
+
+**An unexamined field is not a field that was found safe.** Every list of destination
+names in this project traces back to the corpus, which means the corpus chose the
+vocabulary and a server free to call an argument `target` gets a field no rule ever
+reads. The tempting fix is for the proxy to fetch `tools/list` at startup, and it was
+rejected: the proxy is a pure relay, never speaks first, and the first thing it would
+have to do is correlate a response of its own through the same attribution logic that
+already has to distinguish a `tools/call` result from a `tools/list` result. Trading a
+documented blind spot for a subtle one is not a trade. So `discover` is a separate
+command, against a server the operator names, before the policy is written — which
+also means the answer is worth having *then*. A schema still cannot say what a field
+carries, so it reports every argument and marks only the conventional ones.
 
 **A policy file is configuration, and configuration is not code.** The layer it
 enables is deterministic, offline, and about as clever as an allowlist, but the list
@@ -614,6 +676,7 @@ src/airlock/
   provenance/  taint sources, egress sinks, destination trust
                (rollback on block, so one refused leak cannot poison a session)
   audit/       hash-chained log, chain verification
+  discover.py  ask a live server what its tools accept
   eval/        corpus replay, metrics, report generation, policy-file check
 corpus/        labelled transcripts + benign traffic
 examples/      policy files, e.g. the corpus workspace's

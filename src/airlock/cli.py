@@ -297,6 +297,81 @@ def cmd_replay(argv: Sequence[str]) -> int:
     return 0
 
 
+def cmd_discover(argv: Sequence[str]) -> int:
+    """Ask a server what its tools accept, and what the policy file does not say.
+
+    The corpus taught the policy checker a vocabulary of field names, which means
+    a server free to call an argument `target` hands the policy layer something it
+    never examines. A field nobody looked at is not a field that was found safe,
+    so this goes and reads the real schema instead of inferring it.
+
+    It runs the server the operator names and exits; the proxy stays a pure relay
+    and still decides only what the file says. The schema also cannot say what a
+    field carries, so every argument is listed and only the conventional ones are
+    marked -- a human still decides, and the report says so where they read it.
+    """
+    parser = argparse.ArgumentParser(
+        prog="airlock discover",
+        description="Report a live MCP server's tool arguments and any the policy misses.",
+    )
+    parser.add_argument(
+        "--policy",
+        default=None,
+        help="policy file to check coverage against (default: $AIRLOCK_POLICY)",
+    )
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=30.0,
+        help="seconds to wait for each answer (default: 30)",
+    )
+    parser.add_argument(
+        "--conventional-only",
+        action="store_true",
+        help="report only names following destination convention, not every argument",
+    )
+    parser.add_argument(
+        "server",
+        nargs=argparse.REMAINDER,
+        help="the server to run, after -- (e.g. airlock discover -- npx -y some-server)",
+    )
+    args = parser.parse_args(list(argv))
+
+    command = [part for part in args.server if part != "--"]
+    if not command:
+        print(
+            "error: no server command; put it after --\n"
+            "       airlock discover --policy p.json -- npx -y @scope/server",
+            file=sys.stderr,
+        )
+        return 2
+
+    from airlock.discover import DiscoveryError, fetch, gaps_against, report
+
+    try:
+        discovery = fetch(command, timeout=args.timeout)
+    except DiscoveryError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    policy = _load_policy(str(args.policy) if args.policy else None)
+    if policy is None:
+        print(report(discovery, None))
+        return 0
+
+    gaps = gaps_against(discovery, policy, only_conventional=args.conventional_only)
+    print(report(discovery, gaps))
+    conventional = [gap for gap in gaps if gap.conventional]
+    if gaps:
+        print()
+        print(
+            f"{len(conventional)} of these follow destination convention. A schema cannot "
+            f"say what a field carries, so this is a reading aid and not a verdict; the "
+            f"rest are listed because an ordinary name can still point somewhere."
+        )
+    return 1 if conventional else 0
+
+
 def cmd_policy_check(argv: Sequence[str]) -> int:
     """Report the destination fields a policy file leaves undecided.
 
@@ -710,6 +785,7 @@ usage:
   airlock verify <audit.jsonl>                      check the hash chain
   airlock eval   [options]                          score against the corpus
   airlock policy-check [options]                    fields the policy file does not decide
+  airlock discover  [options] -- <command>          what a live server accepts
 
 examples:
   airlock proxy -- npx -y @modelcontextprotocol/server-filesystem /tmp
@@ -717,6 +793,7 @@ examples:
   airlock verify .airlock/audit.jsonl
   airlock eval --split test --ablation --json results/eval.json
   airlock policy-check --policy examples/corpus-workspace-policy.json
+  airlock discover --policy p.json -- npx -y @modelcontextprotocol/server-filesystem /tmp
 
 run 'airlock <command> --help' for command options.
 """
@@ -737,6 +814,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "replay": cmd_replay,
         "verify": cmd_verify,
         "eval": cmd_eval,
+        "discover": cmd_discover,
         "policy-check": cmd_policy_check,
     }
     handler = handlers.get(command)

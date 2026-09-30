@@ -39,6 +39,7 @@ from mcp.client.stdio import stdio_client
 from mcp.shared.exceptions import McpError
 
 from airlock.audit.log import AuditLog, verify_chain
+from airlock.discover import Discovery, DiscoveryError
 from airlock.gateway.stdio_proxy import StdioProxy, UpstreamSpec
 from airlock.inspect.base import InspectorPipeline
 from airlock.provenance import ProvenanceInspector
@@ -575,3 +576,62 @@ class TestAuditOnRealSessions:
         assert len(host_in.ids) == 2 + len(FAKE_TOKEN), (
             f"the session did not complete: {len(host_in.ids)} replies"
         )
+
+
+class TestDiscoveryAgainstRealServers:
+    """`airlock discover` against servers built on the reference SDK.
+
+    The offline checker derives its vocabulary from the corpus, so it can only
+    report fields the corpus already exercises. That is a real limit and this is
+    the test for the way round it: ask a server that was written against the SDK
+    rather than against our assumptions, and see whether the schema comes back
+    with the field names a policy would need.
+    """
+
+    def _discover(self, surface: str, tmp_path: Path) -> Discovery:
+        from airlock.discover import fetch
+
+        target = tmp_path / "scratch.db" if surface == "sqlite" else tmp_path
+        try:
+            return fetch(
+                [sys.executable, str(FIXTURE), surface, str(target)], timeout=30.0
+            )
+        except DiscoveryError as exc:  # pragma: no cover - diagnostic aid
+            pytest.fail(f"discovery against the {surface} fixture failed: {exc}")
+
+    @pytest.mark.parametrize("surface", ["fetch", "sqlite", "git"])
+    def test_it_reads_the_real_tool_surface(self, surface: str, tmp_path: Path) -> None:
+        found = self._discover(surface, tmp_path)
+        assert found.tools, f"{surface} advertised no tools"
+        assert found.protocol_version
+        assert all(tool.name for tool in found.tools)
+
+    def test_it_finds_the_destination_field_a_real_server_exposes(self, tmp_path: Path) -> None:
+        found = self._discover("fetch", tmp_path)
+        urls = {
+            f"{tool.name}.{name}"
+            for tool in found.tools
+            for name, _ in tool.properties
+        }
+        # The corpus knows post_url.url, so this is the easy case; it is here to
+        # prove the handshake and the parsing hold against a real SDK server rather
+        # than a fixture that shares our assumptions.
+        assert "post_url.url" in urls
+        assert "fetch_url.url" in urls
+
+    def test_it_sees_a_server_the_corpus_never_exercised(self, tmp_path: Path) -> None:
+        # sqlite's `sql` is in the corpus as a credential-column case, but its tool
+        # surface was never part of what the policy checker reads. Discovery is the
+        # only path that reports it.
+        found = self._discover("sqlite", tmp_path)
+        surfaces = found.surfaces
+        assert ("select", "sql") in surfaces
+        assert ("list_tables",) not in {s for s in surfaces if len(s) != 2}
+
+    def test_the_gateway_is_not_involved(self, tmp_path: Path) -> None:
+        # Discovery talks to the server directly. The proxy stays a pure relay and
+        # still decides only what the policy file says; nothing discovered here can
+        # change a verdict.
+        found = self._discover("fetch", tmp_path)
+        assert found.server_name.startswith("airlock-fixture")
+        assert "gateway" not in found.server_name

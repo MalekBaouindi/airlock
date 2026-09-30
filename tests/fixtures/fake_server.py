@@ -30,6 +30,81 @@ def reply(message_id: object, result: dict[str, object]) -> None:
     sys.stdout.flush()
 
 
+def reply_error(message_id: object, message: str, code: int = -32601) -> None:
+    sys.stdout.write(
+        json.dumps(
+            {"jsonrpc": "2.0", "id": message_id, "error": {"code": code, "message": message}}
+        )
+        + "\n"
+    )
+    sys.stdout.flush()
+
+
+EXTRA_TOOL = {
+    "name": "sync_artifact",
+    "description": "Pushes an artifact somewhere.",
+    "inputSchema": {
+        "type": "object",
+        "properties": {
+            "artifact": {"type": "string"},
+            "target": {"type": "string"},
+            "options": {
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string"},
+                    "retries": {"type": "integer"},
+                },
+            },
+        },
+    },
+}
+
+READ_FILE = {
+    "name": "read_file",
+    "description": "Reads a file.",
+    "inputSchema": {"type": "object", "properties": {}},
+}
+
+PING_TOOL = {
+    "name": "ping_host",
+    "description": "Checks a host.",
+    "inputSchema": {
+        "type": "object",
+        "properties": {"host": {"type": "string"}},
+    },
+}
+
+
+def _tools_page(message):
+    """Answer tools/list, honouring the paging and failure modes under test.
+
+    FAKE_TOOLS_EXTRA=1     adds a tool with a destination field named `target`, which
+                           is in no list Airlock ships, plus a nested `options.url`.
+    FAKE_TOOLS_PAGES=1     splits the tool list across two pages.
+    FAKE_TOOLS_CURSOR=<c> always returns the same cursor, to exercise loop detection.
+    FAKE_TOOLS_NO_LIST=1   refuses tools/list the way some servers do.
+    """
+    if os.environ.get("FAKE_TOOLS_NO_LIST") == "1":
+        reply_error(message.get("id"), "Method not found", -32601)
+        return {}
+    tools = [dict(READ_FILE, description=os.environ.get("FAKE_TOOL_DESC", READ_FILE["description"]))]
+    if os.environ.get("FAKE_TOOLS_EXTRA") == "1":
+        tools.append(EXTRA_TOOL)
+    if os.environ.get("FAKE_TOOLS_EXTRA") == "2":
+        tools.append(PING_TOOL)
+    forced = os.environ.get("FAKE_TOOLS_CURSOR")
+    if forced:
+        page = {"tools": tools, "nextCursor": forced}
+        return page
+    if os.environ.get("FAKE_TOOLS_PAGES") == "1":
+        # The first page is not the whole surface. Stopping there would under-report,
+        # which is the exact failure this command exists to remove.
+        if message.get("params", {}).get("cursor") != "page-2":
+            return {"tools": tools[:1], "nextCursor": "page-2"}
+        return {"tools": tools[1:]}
+    return {"tools": tools}
+
+
 def main() -> int:
     for line in sys.stdin:
         line = line.strip()
@@ -47,24 +122,13 @@ def main() -> int:
             reply(
                 message_id,
                 {
-                    "protocolVersion": PROTOCOL_VERSION,
+                    "protocolVersion": os.environ.get("FAKE_PROTOCOL", PROTOCOL_VERSION),
                     "capabilities": {"tools": {}},
                     "serverInfo": {"name": "fake", "version": "0"},
                 },
             )
         elif method == "tools/list":
-            reply(
-                message_id,
-                {
-                    "tools": [
-                        {
-                            "name": "read_file",
-                            "description": os.environ.get("FAKE_TOOL_DESC", "Reads a file."),
-                            "inputSchema": {"type": "object", "properties": {}},
-                        }
-                    ]
-                },
-            )
+            reply(message_id, _tools_page(message))
         elif method == "tools/call":
             name = message.get("params", {}).get("name", "read_file")
             text = os.environ.get("FAKE_TOOL_TEXT", "ordinary file contents")
