@@ -51,6 +51,17 @@ CLIENT_NAME = "airlock-discover"
 
 DEFAULT_TIMEOUT = 30.0
 
+#: How deep to descend into a schema. Real MCP tools nest a field or two --
+#: ``options.headers`` -- so this is generous for anything meant to be read by a
+#: person. It exists because a server can nest without limit, and a recursive walk
+#: over a hostile schema dies with a RecursionError instead of a report.
+MAX_SCHEMA_DEPTH = 6
+
+#: Cap on arguments reported per tool. A schema can advertise as many properties as
+#: it likes; past a few hundred the report stops being something anyone reads, and
+#: a cap that says it capped is more use than an unreadable wall of text.
+MAX_ARGUMENTS_PER_TOOL = 500
+
 
 class DiscoveryError(RuntimeError):
     """The server could not be asked, or would not answer coherently."""
@@ -91,6 +102,10 @@ class ToolSurface:
     #: ``parent.child`` because that is where the interesting arguments live and a
     #: flat list hides them.
     properties: tuple[tuple[str, str], ...] = ()
+    #: Why this tool's argument list is shorter than its schema, if it is. Carried
+    #: rather than dropped, because a report that hides what it did not read is
+    #: indistinguishable from a report of a smaller surface.
+    truncated: str | None = None
 
     @property
     def destination_shaped(self) -> tuple[str, ...]:
@@ -271,44 +286,141 @@ def _ask(server: _Server, request_id: int, method: str, params: dict[str, Any]) 
     raise DiscoveryError(f"{method} was never answered")
 
 
-def _flatten(
-    properties: dict[str, Any], prefix: str = ""
-) -> Iterator[tuple[str, str]]:
-    """Yield (dotted name, type) for a schema's properties, descending one level.
+def _flatten(properties: dict[str, Any], prefix: str = "") -> Iterator[tuple[str, str]]:
+    """Yield (dotted name, type) for a schema's properties, descending as it goes.
 
     Nested objects matter here: a policy that names ``tool.url`` does nothing about
     ``tool.options.url``, and a server that puts the webhook inside ``options`` is
     ordinary.
+
+    The walk is iterative and bounded, and it says when it stopped rather than
+    quietly ending. Three reasons, all learned the hard way:
+
+    - Recursion over a server-supplied schema is a denial of service. A nesting
+      depth a few thousand deep turns ``airlock discover`` into a RecursionError
+      traceback, which is both a crash and a useless answer.
+    - ``select``/depth aside, every level reached is a line in a report meant for a
+      human. Fifty levels of ``options.options.options`` is not information.
+    - Silently truncating is the one failure this command must not have. Under-
+      reporting a surface is exactly the gap it was built to close, so the caller
+      is handed the reason and puts it in the report's notes.
+
+    Yields (name, type) pairs and finally, if anything was dropped, a
+    ``("", reason)`` pair that carries the explanation and no argument.
     """
-    for name, schema in properties.items():
-        path = f"{prefix}{name}"
+    stack: list[tuple[str, Any, int, str]] = [
+        (name, schema, 0, name) for name, schema in properties.items()
+    ]
+    seen = 0
+    while stack:
+        _name, schema, depth, path = stack.pop()
         if not isinstance(schema, dict):
             yield path, "unknown"
             continue
         declared = schema.get("type")
-        kind = declared if isinstance(declared, str) else "object?" if "properties" in schema else "?"
+        kind = (
+            declared
+            if isinstance(declared, str)
+            else "object?"
+            if "properties" in schema
+            else "?"
+        )
         yield path, kind
-        if isinstance(schema.get("properties"), dict):
-            yield from _flatten(schema["properties"], prefix=f"{path}.")
+        seen += 1
+        if seen >= MAX_ARGUMENTS_PER_TOOL:
+            yield (
+                "",
+                f"{path}: stopped at {MAX_ARGUMENTS_PER_TOOL} arguments, "
+                f"{len(stack)} more not walked",
+            )
+            return
+        if depth >= MAX_SCHEMA_DEPTH:
+            continue
+        nested = schema.get("properties")
+        if isinstance(nested, dict) and nested:
+            # The path travels with the node: a policy names `tool.options.url`, and
+            # a flattening that dropped the ancestry would report `url` and quietly
+            # stop matching the file it is supposed to be checking against.
+            # Reversed, because a stack pops last-in first.
+            for child_name, child in reversed(list(nested.items())):
+                stack.append((child_name, child, depth + 1, f"{path}.{child_name}"))
+    if seen and _nests_deeper_than_walked(properties):
+        yield (
+            "",
+            f"nesting deeper than {MAX_SCHEMA_DEPTH} levels was not walked, so this "
+            f"tool's argument list may be shorter than its schema",
+        )
 
 
-def _tools_from(result: Any) -> tuple[ToolSurface, ...]:
+def _nests_deeper_than_walked(properties: Any) -> bool:
+    """Whether any node the walk declined to descend into had properties.
+
+    The threshold comes from the walk's own rule -- it stops descending at
+    ``MAX_SCHEMA_DEPTH`` -- so the two cannot drift apart. Bounded by the same
+    rule: the answer is found within a few levels or not at all, so a
+    thousand-deep schema costs a short walk rather than the whole thing.
+
+    Takes the mapping of property name to schema and starts its values at depth 0,
+    which is the depth the walk gives them, so a boundary here means the same
+    boundary there.
+    """
+    if not isinstance(properties, dict):
+        return False
+    stack: list[tuple[Any, int]] = [(value, 0) for value in properties.values()]
+    while stack:
+        node, depth = stack.pop()
+        if not isinstance(node, dict):
+            continue
+        nested = node.get("properties")
+        if not isinstance(nested, dict) or not nested:
+            continue
+        if depth >= MAX_SCHEMA_DEPTH:
+            return True
+        for value in nested.values():
+            stack.append((value, depth + 1))
+    return False
+
+
+def _tools_from(result: Any) -> tuple[tuple[ToolSurface, ...], list[str]]:
+    """Turn a tools/list page into tool surfaces, plus notes on what was unread.
+
+    Returns the notes rather than swallowing them. An entry that cannot be read is
+    a tool this report does not describe, and a report that silently drops one is
+    indistinguishable from a report of a smaller server -- which is the single
+    failure this command was written to avoid.
+    """
     if not isinstance(result, dict) or not isinstance(result.get("tools"), list):
         raise DiscoveryError("tools/list did not return a 'tools' array")
     tools: list[ToolSurface] = []
+    notes: list[str] = []
     for entry in result["tools"]:
         if not isinstance(entry, dict):
+            notes.append(
+                f"a tools/list entry was {type(entry).__name__}, not an object, and was "
+                f"not read; this tool is not described below"
+            )
             continue
         schema = entry.get("inputSchema")
         properties = schema.get("properties") if isinstance(schema, dict) else None
+        pairs = list(_flatten(properties)) if isinstance(properties, dict) else []
+        dropped = [reason for name, reason in pairs if not name]
+        name = entry.get("name")
+        if not isinstance(name, str) or not name:
+            notes.append(
+                f"a tool with no usable name (got {name!r}) was read as "
+                f"<unnamed>; its arguments are listed but cannot be named in a policy"
+            )
+        if dropped:
+            notes.extend(f"{name or '<unnamed>'}: {reason}" for reason in dropped)
         tools.append(
             ToolSurface(
-                name=str(entry.get("name", "<unnamed>")),
+                name=name if isinstance(name, str) and name else "<unnamed>",
                 description=str(entry.get("description", "")).strip(),
-                properties=tuple(_flatten(properties)) if isinstance(properties, dict) else (),
+                properties=tuple(p for p in pairs if p[0]),
+                truncated="; ".join(dropped) or None,
             )
         )
-    return tuple(tools)
+    return tuple(tools), notes
 
 
 def fetch(argv: Sequence[str], timeout: float = DEFAULT_TIMEOUT) -> Discovery:
@@ -353,7 +465,9 @@ def fetch(argv: Sequence[str], timeout: float = DEFAULT_TIMEOUT) -> Discovery:
             page = _ask(server, 2 + len(tools), "tools/list", params)
             if not isinstance(page, dict):
                 raise DiscoveryError("tools/list did not return an object")
-            tools.extend(_tools_from(page))
+            page_tools, page_notes = _tools_from(page)
+            tools.extend(page_tools)
+            notes.extend(page_notes)
             nxt = page.get("nextCursor")
             if not isinstance(nxt, str) or not nxt:
                 break
@@ -434,6 +548,8 @@ def report(discovery: Discovery, gaps: Sequence[Gap] | None) -> str:
         for argument, kind in tool.properties:
             mark = "~" if looks_destination_shaped(argument) else " "
             lines.append(f"   {mark} {argument}: {kind}")
+        if tool.truncated:
+            lines.append(f"     ! {tool.truncated}")
         lines.append("")
     if not discovery.tools:
         lines.append("  (no tools advertised)")

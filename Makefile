@@ -1,4 +1,4 @@
-.PHONY: help sync model judge judge-stop lint format typecheck test integration coverage corpus verify eval eval-dev eval-semantic ablation policy-check smoke all clean
+.PHONY: help sync model judge judge-stop lint format typecheck test integration coverage corpus verify eval eval-dev eval-semantic ablation policy-check probe-schema fingerprint smoke all clean
 
 PY := .venv/bin/python
 AIRLOCK := .venv/bin/airlock
@@ -87,7 +87,13 @@ smoke:  ## End-to-end check through the installed CLI
 policy-check:  ## Is the policy file still deciding every destination the traffic uses?
 	$(AIRLOCK) policy-check --policy $(POLICY)
 
-all: lint typecheck test policy-check  ## Everything CI runs
+probe-schema:  ## Does the schema parser diagnose hostile input instead of crashing?
+	$(PY) scripts/probe_schema.py
+
+fingerprint:  ## Print every per-step decision, for comparing runs across hash seeds
+	$(PY) scripts/fingerprint.py
+
+all: lint typecheck test policy-check probe-schema  ## Everything CI runs
 
 clean:  ## Remove caches and local artifacts
 	rm -rf .pytest_cache .mypy_cache .ruff_cache htmlcov .coverage results

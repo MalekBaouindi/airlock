@@ -83,6 +83,12 @@ class StepResult:
     expected: StepExpectation
     actual: Verdict
     rules: tuple[str, ...] = ()
+    #: The same rule names in the order the pipeline emitted them, which `rules`
+    #: deliberately discards. A verdict cannot depend on this -- the action is a
+    #: rank maximum over inspectors, and the inspectors are a tuple -- but the
+    #: audit log records findings in this order, so a tool that fingerprints
+    #: decisions has a use for it.
+    rule_order: tuple[str, ...] = ()
     outcome: Literal["match", "gap", "mismatch", "false-positive"] = "match"
     #: Wall-clock inspection time for this step, in nanoseconds.
     nanos: int = 0
@@ -376,6 +382,7 @@ def replay_case(
                 expected=expected,
                 actual=actual,
                 rules=tuple(sorted({f.rule for f in verdict.findings})),
+                rule_order=tuple(f.rule for f in verdict.findings),
                 outcome=classify(expected, actual, layers),  # type: ignore[arg-type]
                 nanos=nanos,
                 severity=case.severity,

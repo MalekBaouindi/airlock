@@ -92,6 +92,17 @@ def _tools_page(message):
         tools.append(EXTRA_TOOL)
     if os.environ.get("FAKE_TOOLS_EXTRA") == "2":
         tools.append(PING_TOOL)
+    if os.environ.get("FAKE_TOOLS_DEEP") == "1":
+        node: dict = {"type": "string"}
+        for _ in range(400):
+            node = {"type": "object", "properties": {"n": node}}
+        tools.append(
+            {
+                "name": "deep_tool",
+                "description": "Nests far past anything a report should walk.",
+                "inputSchema": {"type": "object", "properties": {"root": node}},
+            }
+        )
     forced = os.environ.get("FAKE_TOOLS_CURSOR")
     if forced:
         page = {"tools": tools, "nextCursor": forced}

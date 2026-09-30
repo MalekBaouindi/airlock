@@ -280,6 +280,17 @@ a verdict — this is an operator reading a surface before writing a policy. **I
 server**: a server that never answers `tools/list`, or that writes a banner to the
 stdout wire, is reported as unseen rather than guessed at from tool names.
 
+Being the parser of a server's JSON makes it the newest untrusted-input reader in the
+project, so it was probed like one (`make probe-schema`). A schema nested a few
+thousand levels deep killed it with a `RecursionError` traceback — a denial of service
+from a single field, in the one command whose whole job is to describe a surface to a
+human. The walk is now iterative and bounded, and every bound it applies is *reported*:
+objects nested more than six deep, more than five hundred arguments on one tool, and
+any tool entry that could not be read at all each produce a note, because the one
+failure this command must not have is a report that quietly describes less than the
+server does. A report that hides what it did not read is indistinguishable from a
+report of a smaller server.
+
 ## The local judge
 
 The semantic layer needs a model server. It is not a dependency of the project:
@@ -461,7 +472,21 @@ passes, and the corpus never contained a destination naming two hosts.
 
 It is the kind of bug that survives a green suite by construction, which is why the
 regression test spawns subprocesses with fixed seeds rather than calling the code
-twice. The same function also read only the first recipient of a list, so the same
+twice — but one transcript is still only one transcript. So there is also a check
+over *every* per-step decision the corpus produces: `scripts/fingerprint.py` prints
+the expected verdict, the actual verdict, the outcome, the rule set and the order the
+pipeline emitted those rules in, and `tests/test_determinism.py` requires six seeds to
+produce byte-identical output. `airlock eval --json` cannot answer this, because it
+reports aggregates and two different sets of per-step verdicts can average to the same
+number — which is exactly what happened when the bug above was injected again during
+this work: every case stayed `block`, and half of them quietly lost a rule.
+
+Both halves of the fingerprint are load-bearing. An earlier version sorted the rule
+names, on the reasoning that finding order cannot affect a verdict — the action is a
+rank maximum over a tuple of inspectors, so it cannot — and adding
+`sorted(verdict.findings, key=hash)` to the pipeline then passed the entire suite,
+this check included. It now records the emission order too, because the audit log
+writes findings down in that order. The same function also read only the first recipient of a list, so the same
 address blocked as a string and allowed as a one-item list. Both were found by
 asking what the function was *for* — "which place is this field addressed to" — and
 noticing it was answering a different question, "which hosts does this text
@@ -678,6 +703,7 @@ src/airlock/
   audit/       hash-chained log, chain verification
   discover.py  ask a live server what its tools accept
   eval/        corpus replay, metrics, report generation, policy-file check
+scripts/       smoke check, per-step decision fingerprint, hostile-schema probe
 corpus/        labelled transcripts + benign traffic
 examples/      policy files, e.g. the corpus workspace's
 tests/         unit + integration (real MCP servers)

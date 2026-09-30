@@ -322,3 +322,104 @@ def tmp_script(body: str) -> list[str]:
     path = _Path(tempfile.mkdtemp()) / "server.py"
     path.write_text(body)
     return [sys.executable, str(path)]
+
+
+def _deep_schema(depth: int) -> dict[str, object]:
+    node: dict[str, object] = {"type": "string"}
+    for _ in range(depth):
+        node = {"type": "object", "properties": {"n": node}}
+    return {"type": "object", "properties": {"root": node}}
+
+
+class TestHostileSchemas:
+    """`discover` parses JSON an arbitrary server supplied.
+
+    That makes it the newest untrusted-input parser in the project, and a recursive
+    walk over a server-supplied schema is a denial of service: a nesting depth a few
+    thousand deep turns the command into a RecursionError traceback, which is both a
+    crash and a useless answer.
+    """
+
+    @pytest.mark.parametrize("depth", [2000, 10000])
+    def test_a_deeply_nested_schema_does_not_crash(self, depth: int) -> None:
+        from airlock.discover import _tools_from
+
+        tools, notes = _tools_from({"tools": [{"name": "t", "inputSchema": _deep_schema(depth)}]})
+        assert tools[0].properties
+        # Not a crash, and not silence either: it says what it declined to walk.
+        assert tools[0].truncated is not None
+        assert notes
+
+    def test_it_reports_that_it_stopped_short_rather_than_looking_complete(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Silently truncating is the one failure this command must not have:
+        # under-reporting a surface is the gap it was built to close.
+        found = discover(monkeypatch, FAKE_TOOLS_DEEP="1")
+        tool = next(t for t in found.tools if t.name == "deep_tool")
+        assert tool.truncated is not None
+        assert "deeper than" in tool.truncated
+        assert any("deep_tool" in note for note in found.notes)
+
+    def test_a_schema_within_the_limit_is_not_called_truncated(self) -> None:
+        from airlock.discover import MAX_SCHEMA_DEPTH, _tools_from
+
+        tools, _notes = _tools_from({"tools": [{"name": "t", "inputSchema": _deep_schema(5)}]})
+        tool = tools[0]
+        assert tool.truncated is None
+        assert len(tool.properties) == MAX_SCHEMA_DEPTH
+
+    def test_a_wide_schema_is_capped_and_says_so(self) -> None:
+        from airlock.discover import MAX_ARGUMENTS_PER_TOOL, _tools_from
+
+        wide = {
+            "name": "wide",
+            "inputSchema": {
+                "type": "object",
+                "properties": {f"p{i}": {"type": "string"} for i in range(3000)},
+            },
+        }
+        tools, _notes = _tools_from({"tools": [wide]})
+        tool = tools[0]
+        assert len(tool.properties) == MAX_ARGUMENTS_PER_TOOL
+        assert tool.truncated is not None
+        assert "not walked" in tool.truncated
+
+    def test_flat_and_shallow_schemas_report_nothing_dropped(self) -> None:
+        from airlock.discover import _tools_from
+
+        cases = [
+            {"type": "object", "properties": {}},
+            {"type": "object", "properties": {"a": {"type": "string"}}},
+            {"name": None, "inputSchema": None},
+            {"name": "t", "inputSchema": {"type": "object", "properties": None}},
+            {"name": "t", "inputSchema": "not a schema"},
+        ]
+        for entry in cases:
+            tools, notes = _tools_from({"tools": [entry]})
+            assert tools[0].truncated is None
+            assert not [n for n in notes if "was not read" in n or "unreadable" in n]
+
+    @pytest.mark.parametrize(
+        "entry",
+        [
+            "not a dict",
+            {"name": {"nested": "dict"}},
+            {"name": "t", "inputSchema": {"type": "object", "properties": ["a"]}},
+            {"name": "t", "inputSchema": {"type": "object", "properties": {"a": None}}},
+        ],
+    )
+    def test_malformed_entries_are_reported_not_fatal(self, entry: object) -> None:
+        # One bad tool must not lose the report on every other tool, and must not
+        # crash either -- a server that gets its schema wrong is common.
+        from airlock.discover import _tools_from
+
+        tools, notes = _tools_from({"tools": [entry, {"name": "good", "inputSchema": None}]})
+        assert any(t.name == "good" for t in tools)
+        if entry == "not a dict":
+            # Dropping it quietly would make a 2-tool report out of a 3-tool
+            # server, which is the one thing this command must not do.
+            assert len(tools) == 1
+            assert any("was not read" in note for note in notes)
+        else:
+            assert len(tools) == 2
