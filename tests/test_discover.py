@@ -70,7 +70,9 @@ class TestPagination:
         found = discover(monkeypatch, FAKE_TOOLS_EXTRA="1", FAKE_TOOLS_PAGES="1")
         assert [t.name for t in found.tools] == ["read_file", "sync_artifact"]
 
-    def test_a_repeating_cursor_does_not_loop_forever(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_a_repeating_cursor_does_not_loop_forever(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         found = discover(monkeypatch, FAKE_TOOLS_CURSOR="stuck")
         assert found.tools
         assert any("repeated cursor" in note for note in found.notes)
@@ -128,7 +130,9 @@ class TestHonesty:
         assert "does not say what a field carries" in text
         assert "convention, not" in text
 
-    def test_a_protocol_mismatch_is_surfaced_not_papered_over(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_a_protocol_mismatch_is_surfaced_not_papered_over(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         monkeypatch.setenv("FAKE_PROTOCOL", "1999-01-01")
         found = discover(monkeypatch)
         assert any("negotiated protocol 1999-01-01" in note for note in found.notes)
@@ -153,9 +157,7 @@ class TestProcessHygiene:
 
 
 class TestCommand:
-    def test_no_server_command_is_an_error(
-        self, capsys: pytest.CaptureFixture[str]
-    ) -> None:
+    def test_no_server_command_is_an_error(self, capsys: pytest.CaptureFixture[str]) -> None:
         assert main(["discover"]) == 2
         assert "no server command" in capsys.readouterr().err
 
@@ -205,13 +207,13 @@ class TestCommand:
 def test_fake_server_env_is_not_leaked_between_runs() -> None:
     # The fixture reads FAKE_* from the environment; if these leak, a later test
     # silently gets a different server than it asked for.
-    assert not any(key.startswith("FAKE_TOOLS_") for key in os.environ if key != "FAKE_TOOLS_CURSOR")
+    assert not any(
+        key.startswith("FAKE_TOOLS_") for key in os.environ if key != "FAKE_TOOLS_CURSOR"
+    )
 
 
 class TestStdoutIsTheWire:
-    def test_a_server_that_prints_to_stdout_is_diagnosed_not_traced(
-        self, tmp_path: Path
-    ) -> None:
+    def test_a_server_that_prints_to_stdout_is_diagnosed_not_traced(self, tmp_path: Path) -> None:
         # stdout is the transport. A banner or a log line there is not untidy, it
         # has broken the protocol, and a JSON traceback about line 1 column 1 tells
         # the operator nothing about which end is at fault.
@@ -276,7 +278,7 @@ class TestTheReadDeadline:
         script = tmp_script(
             "import sys, time\n"
             "for line in sys.stdin:\n"
-            "    sys.stdout.write('{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{')\n"
+            '    sys.stdout.write(\'{"jsonrpc":"2.0","id":1,"result":{\')\n'
             "    sys.stdout.flush()\n"
             "    for _ in range(60):\n"
             "        sys.stdout.write(' ')\n"
@@ -297,9 +299,20 @@ class TestTheReadDeadline:
         # that is thinking from a child that died before writing anything, and it is
         # the message a flaky run will produce.
         started = time.monotonic()
-        assert main(
-            ["discover", "--timeout", "2", "--", sys.executable, "-c", "import time; time.sleep(30)"]
-        ) == 2
+        assert (
+            main(
+                [
+                    "discover",
+                    "--timeout",
+                    "2",
+                    "--",
+                    sys.executable,
+                    "-c",
+                    "import time; time.sleep(30)",
+                ]
+            )
+            == 2
+        )
         assert time.monotonic() - started < 15, "a failure should not cost the default 30s"
         err = capsys.readouterr().err
         assert "did not answer within 2s" in err
@@ -307,9 +320,10 @@ class TestTheReadDeadline:
         assert "never answered the handshake" in err
 
     def test_a_dead_child_is_reported_as_dead(self, capsys: pytest.CaptureFixture[str]) -> None:
-        assert main(
-            ["discover", "--timeout", "10", "--", sys.executable, "-c", "raise SystemExit(3)"]
-        ) == 2
+        assert (
+            main(["discover", "--timeout", "10", "--", sys.executable, "-c", "raise SystemExit(3)"])
+            == 2
+        )
         err = capsys.readouterr().err
         # "closed its output" alone cannot be acted on; the exit status can.
         assert "closed its output after 0 line(s)" in err

@@ -272,9 +272,7 @@ def _parse_surfaces(raw: dict[str, Any], path: Path) -> dict[str, dict[str, Surf
         table: dict[str, Surface] = {}
         for argument, spec in arguments.items():
             if not isinstance(spec, dict):
-                raise PolicyError(
-                    f"{path}: surfaces[{tool!r}][{argument!r}] must be an object"
-                )
+                raise PolicyError(f"{path}: surfaces[{tool!r}][{argument!r}] must be an object")
             anywhere = spec.get("anywhere", False)
             allow = spec.get("allow", [])
             if anywhere and allow:
@@ -283,9 +281,7 @@ def _parse_surfaces(raw: dict[str, Any], path: Path) -> dict[str, dict[str, Surf
                     f"'anywhere' and an allowlist; one of them is a mistake"
                 )
             if not anywhere and not isinstance(allow, list):
-                raise PolicyError(
-                    f"{path}: surfaces[{tool!r}][{argument!r}].allow must be a list"
-                )
+                raise PolicyError(f"{path}: surfaces[{tool!r}][{argument!r}].allow must be a list")
             table[argument] = Surface(
                 allow=tuple(str(entry).lower() for entry in allow),
                 anywhere=bool(anywhere),

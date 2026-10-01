@@ -104,14 +104,13 @@ def test_the_fingerprint_is_not_vacuous(per_seed: dict[str, str]) -> None:
 
 
 def test_the_fingerprint_records_finding_order_not_just_the_rule_set(
-    per_seed: dict[str, str]
+    per_seed: dict[str, str],
 ) -> None:
     # The order column has to be present and has to differ from the sorted set
     # somewhere, or it is decoration and the guard above is weaker than it reads.
     lines = [line for line in per_seed["0"].splitlines() if not line.startswith("#")]
     multi = [line for line in lines if line.count("\t") == 7]
     assert multi, "no step carried findings, so the order column was never exercised"
-    assert any(
-        line.split("\t")[6] != line.split("\t")[7]
-        for line in multi
-    ), "every step's emission order was already sorted; nothing is being compared"
+    assert any(line.split("\t")[6] != line.split("\t")[7] for line in multi), (
+        "every step's emission order was already sorted; nothing is being compared"
+    )

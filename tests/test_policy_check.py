@@ -89,7 +89,10 @@ class TestTheQuestionItAsks:
         policy = Policy(surfaces={"*": {"url": Surface(allow=("a.example",))}})
         check = check_policy(
             policy,
-            [case("http_post", {"url": "https://a.example"}), case("send_post", {"url": "https://a.example"})],
+            [
+                case("http_post", {"url": "https://a.example"}),
+                case("send_post", {"url": "https://a.example"}),
+            ],
         )
         assert check.is_clean
         assert len(check.surfaces) == 2
@@ -136,7 +139,9 @@ class TestWhatItRefusesToCount:
         assert check.surfaces == ()
 
     def test_a_list_argument_counts_as_one_surface(self) -> None:
-        policy = Policy(surfaces={"create_calendar_event": {"attendees": Surface(allow=("@a.example",))}})
+        policy = Policy(
+            surfaces={"create_calendar_event": {"attendees": Surface(allow=("@a.example",))}}
+        )
         check = check_policy(
             policy,
             [
@@ -156,7 +161,14 @@ class TestUrgency:
         policy = Policy(surfaces={})
         check = check_policy(
             policy,
-            [case("http_post", {"url": "https://evil.example"}, verdict="block", case_id="exfil-001")],
+            [
+                case(
+                    "http_post",
+                    {"url": "https://evil.example"},
+                    verdict="block",
+                    case_id="exfil-001",
+                )
+            ],
         )
         gap = check.gaps[0]
         assert gap.expected_harm_undecided
@@ -170,7 +182,14 @@ class TestUrgency:
         policy = Policy(surfaces={})
         check = check_policy(
             policy,
-            [case("web_fetch", {"url": "https://docs.example"}, verdict="allow", case_id="framing-001")],
+            [
+                case(
+                    "web_fetch",
+                    {"url": "https://docs.example"},
+                    verdict="allow",
+                    case_id="framing-001",
+                )
+            ],
         )
         gap = check.gaps[0]
         assert not gap.expected_harm_undecided
@@ -245,11 +264,7 @@ class TestTheRealCorpus:
         # evidence either way that this project has.
         policy = Policy.load(EXAMPLE)
         used = {s.surface for s in check_policy(policy, load_corpus(CORPUS)).surfaces}
-        named = {
-            f"{tool}.{arg}"
-            for tool, surfaces in policy.surfaces.items()
-            for arg in surfaces
-        }
+        named = {f"{tool}.{arg}" for tool, surfaces in policy.surfaces.items() for arg in surfaces}
         assert used == named
 
     def test_the_calendar_attendee_list_is_inside_the_scope(self) -> None:
@@ -267,7 +282,12 @@ class TestNoModelNoState:
         # without a judge and gives the same answer every time. If a future
         # change makes it behavioural, this should start failing to import.
         source = (CORPUS.parent / "src/airlock/eval/policy_check.py").read_text()
-        for banned in ("StructuralInspector", "ProvenanceInspector", "PolicyInspector", "LocalModel"):
+        for banned in (
+            "StructuralInspector",
+            "ProvenanceInspector",
+            "PolicyInspector",
+            "LocalModel",
+        ):
             assert banned not in source
 
 

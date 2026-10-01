@@ -97,9 +97,7 @@ reason   ::= [^\n]{0,200}
 #: above" has not chosen an answer, it has produced text that contains one, and
 #: treating that as a verdict is how a layer starts agreeing with whatever
 #: shape the model happened to write. Anything else is a failure.
-_VERDICT_RE = re.compile(
-    r"(?im)^\s*verdict\s*[:\-]\s*(injection|block|flag|none)\b"
-)
+_VERDICT_RE = re.compile(r"(?im)^\s*verdict\s*[:\-]\s*(injection|block|flag|none)\b")
 
 #: What each leg is allowed to answer. The two legs are different questions
 #: with different answers, so each rejects the other's vocabulary: a request
@@ -432,7 +430,9 @@ def _payload_of(arguments: dict[str, Any]) -> str:
             parts.append(str(value))
         elif isinstance(value, (dict, list)):
             rendered = json.dumps(value, ensure_ascii=False, sort_keys=True)
-            if rendered.strip("{}[] \"",):
+            if rendered.strip(
+                '{}[] "',
+            ):
                 parts.append(rendered)
     return " ".join(parts)
 

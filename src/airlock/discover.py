@@ -126,9 +126,7 @@ class Discovery:
     @property
     def surfaces(self) -> tuple[tuple[str, str], ...]:
         """Every (tool, property) pair, for checking against a policy."""
-        return tuple(
-            (tool.name, prop) for tool in self.tools for prop, _ in tool.properties
-        )
+        return tuple((tool.name, prop) for tool in self.tools for prop, _ in tool.properties)
 
 
 # -- the wire ------------------------------------------------------------------
@@ -319,8 +317,7 @@ def _ask(server: _Server, request_id: int, method: str, params: dict[str, Any]) 
         if "error" in raw:
             error = raw["error"]
             raise DiscoveryError(
-                f"{method} failed: {error.get('message', error)!r} "
-                f"(code {error.get('code', '?')})"
+                f"{method} failed: {error.get('message', error)!r} (code {error.get('code', '?')})"
             )
         return raw.get("result")
     raise DiscoveryError(f"{method} was never answered")
@@ -359,11 +356,7 @@ def _flatten(properties: dict[str, Any], prefix: str = "") -> Iterator[tuple[str
             continue
         declared = schema.get("type")
         kind = (
-            declared
-            if isinstance(declared, str)
-            else "object?"
-            if "properties" in schema
-            else "?"
+            declared if isinstance(declared, str) else "object?" if "properties" in schema else "?"
         )
         yield path, kind
         seen += 1
@@ -548,7 +541,9 @@ class Gap:
         return f"{self.tool}.{self.argument}"
 
 
-def gaps_against(discovery: Discovery, policy: Any, *, only_conventional: bool = False) -> list[Gap]:
+def gaps_against(
+    discovery: Discovery, policy: Any, *, only_conventional: bool = False
+) -> list[Gap]:
     """Report (tool, argument) pairs a policy does not govern.
 
     ``only_conventional`` narrows the report to names that follow destination
@@ -556,7 +551,9 @@ def gaps_against(discovery: Discovery, policy: Any, *, only_conventional: bool =
     mention, because the whole point is to show a human something they had not
     considered and a schema cannot tell us which of those matter.
     """
-    covered = {(tool, argument) for tool, arguments in policy.surfaces.items() for argument in arguments}
+    covered = {
+        (tool, argument) for tool, arguments in policy.surfaces.items() for argument in arguments
+    }
     gaps: list[Gap] = []
     for tool in discovery.tools:
         for argument, _ in tool.properties:

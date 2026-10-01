@@ -93,7 +93,9 @@ def _tools_page(message):
     if os.environ.get("FAKE_TOOLS_NO_LIST") == "1":
         reply_error(message.get("id"), "Method not found", -32601)
         return {}
-    tools = [dict(READ_FILE, description=os.environ.get("FAKE_TOOL_DESC", READ_FILE["description"]))]
+    tools = [
+        dict(READ_FILE, description=os.environ.get("FAKE_TOOL_DESC", READ_FILE["description"]))
+    ]
     if os.environ.get("FAKE_TOOLS_EXTRA") == "1":
         tools.append(EXTRA_TOOL)
     if os.environ.get("FAKE_TOOLS_EXTRA") == "2":

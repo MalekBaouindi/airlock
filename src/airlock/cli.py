@@ -142,7 +142,9 @@ def build_proxy_layers(
         # otherwise mean a threshold that silently never matches.
         level = cast("Severity | None", None if block_at in ("none", None) else block_at)
         if level is not None and level not in SEVERITY_RANK:
-            raise ValueError(f"unknown severity {block_at!r}; expected one of {tuple(SEVERITY_RANK)}")
+            raise ValueError(
+                f"unknown severity {block_at!r}; expected one of {tuple(SEVERITY_RANK)}"
+            )
         inspectors.append(StructuralInspector(block_at=level))
     if provenance:
         inspectors.append(ProvenanceInspector())
@@ -501,7 +503,9 @@ def cmd_policy_check(argv: Sequence[str]) -> int:
             if surface.decision == "undecided":
                 # A block the corpus expects here and the file will not make is the
                 # whole point of the command, so it gets the only mark in the table.
-                mark, style = ("GAP", "bold red") if surface.expected_harm_undecided else ("gap", "red")
+                mark, style = (
+                    ("GAP", "bold red") if surface.expected_harm_undecided else ("gap", "red")
+                )
             elif surface.decision == "anywhere":
                 mark, style = "open", "yellow"
             else:
@@ -818,8 +822,7 @@ def cmd_eval(argv: Sequence[str]) -> int:
             # so it reported gaps the table did not and `stopped: 0` beside
             # families the table had caught.
             "per_family": {
-                family: stats.as_json()
-                for family, stats in sorted(report.family_stats().items())
+                family: stats.as_json() for family, stats in sorted(report.family_stats().items())
             },
         }
         args.json.parent.mkdir(parents=True, exist_ok=True)

@@ -96,9 +96,7 @@ class TestNormalisation:
             ("@acmecorp.example", "https://acmecorp.example/x", False),
         ],
     )
-    def test_wildcards_do_not_overreach(
-        self, rule: str, destination: str, expected: bool
-    ) -> None:
+    def test_wildcards_do_not_overreach(self, rule: str, destination: str, expected: bool) -> None:
         assert Surface(allow=(rule,)).permits(destination) is expected
 
     def test_a_port_is_not_a_different_destination(self) -> None:
@@ -220,7 +218,10 @@ class TestTheSurfaceIsTheUnit:
             }
         )
         verdict = PolicyInspector(policy).inspect_request(
-            call("http_post", {"url": "https://metrics.internal/v1", "mirror": "https://evil.example/"}),
+            call(
+                "http_post",
+                {"url": "https://metrics.internal/v1", "mirror": "https://evil.example/"},
+            ),
             SessionContext(),
         )
         assert verdict.action == "block"
@@ -235,7 +236,9 @@ class TestTheRequestLegOnly:
         """
         policy = Policy(surfaces={"http_post": {"url": Surface(allow=())}})
         response = Message({"jsonrpc": "2.0", "id": 1, "result": {"content": "evil.example"}})
-        assert PolicyInspector(policy).inspect_response(response, SessionContext()).action == "allow"
+        assert (
+            PolicyInspector(policy).inspect_response(response, SessionContext()).action == "allow"
+        )
 
     def test_a_call_with_no_arguments_is_allowed(self) -> None:
         policy = Policy(surfaces={"http_post": {"url": Surface(allow=())}})

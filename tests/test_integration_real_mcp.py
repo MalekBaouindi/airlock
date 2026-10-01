@@ -593,9 +593,7 @@ class TestDiscoveryAgainstRealServers:
 
         target = tmp_path / "scratch.db" if surface == "sqlite" else tmp_path
         try:
-            return fetch(
-                [sys.executable, str(FIXTURE), surface, str(target)], timeout=30.0
-            )
+            return fetch([sys.executable, str(FIXTURE), surface, str(target)], timeout=30.0)
         except DiscoveryError as exc:  # pragma: no cover - diagnostic aid
             pytest.fail(f"discovery against the {surface} fixture failed: {exc}")
 
@@ -608,11 +606,7 @@ class TestDiscoveryAgainstRealServers:
 
     def test_it_finds_the_destination_field_a_real_server_exposes(self, tmp_path: Path) -> None:
         found = self._discover("fetch", tmp_path)
-        urls = {
-            f"{tool.name}.{name}"
-            for tool in found.tools
-            for name, _ in tool.properties
-        }
+        urls = {f"{tool.name}.{name}" for tool in found.tools for name, _ in tool.properties}
         # The corpus knows post_url.url, so this is the easy case; it is here to
         # prove the handshake and the parsing hold against a real SDK server rather
         # than a fixture that shares our assumptions.

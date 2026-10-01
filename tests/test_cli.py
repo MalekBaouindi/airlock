@@ -145,9 +145,7 @@ class TestVerify:
         # 1 means something was edited. 2 means the log stopped early. The
         # responses are different -- look for an edit, or look for a full disk --
         # and a monitor can act on the difference.
-        log_with_session.write_text(
-            log_with_session.read_text() + '{"seq": 99, "ts": 1, "sessi'
-        )
+        log_with_session.write_text(log_with_session.read_text() + '{"seq": 99, "ts": 1, "sessi')
         assert main(["verify", str(log_with_session)]) == 2
         err = capsys.readouterr().err
         assert "TRUNCATED" in err
@@ -221,10 +219,22 @@ class TestEvalJsonAgreesWithTheTable:
     @pytest.mark.parametrize("layers", ["all", "provenance", "policy", "structural", "none"])
     def test_per_family_matches_the_shared_grade(self, tmp_path: Path, layers: str) -> None:
         out = tmp_path / "report.json"
-        assert main(
-            ["eval", "--split", "test", "--layers", layers, "--policy", self.POLICY,
-             "--json", str(out)]
-        ) == 0
+        assert (
+            main(
+                [
+                    "eval",
+                    "--split",
+                    "test",
+                    "--layers",
+                    layers,
+                    "--policy",
+                    self.POLICY,
+                    "--json",
+                    str(out),
+                ]
+            )
+            == 0
+        )
         payload = json.loads(out.read_text())
 
         from airlock.cli import _load_policy, build_layers

@@ -236,9 +236,7 @@ class TestRequestLeg:
         """
         model = StubModel()
         inspector = SemanticInspector(model=model)
-        inspector.inspect_request(
-            call(1, "read_file", {"path": "/etc/secret"}), SessionContext()
-        )
+        inspector.inspect_request(call(1, "read_file", {"path": "/etc/secret"}), SessionContext())
         assert model.asked == []
 
     def test_nested_payloads_reach_the_judge(self) -> None:
