@@ -14,6 +14,7 @@ from airlock.discover import (
     Discovery,
     DiscoveryError,
     ToolSurface,
+    _Server,
     fetch,
     gaps_against,
     looks_destination_shaped,
@@ -423,3 +424,84 @@ class TestHostileSchemas:
             assert any("was not read" in note for note in notes)
         else:
             assert len(tools) == 2
+
+
+class TestTeardown:
+    """The command must not outlive its own usefulness.
+
+    A server that answers every question and then stops watching stdin has given
+    us everything we came for. It has not, however, gone away, and closing its
+    stdin is not a signal it is listening for. Waiting out the full protocol
+    timeout for it made a discovery that completed in milliseconds look like one
+    that had hung -- which is how this presented: a 30s stall with a live child
+    and no error, seen twice and never explained.
+    """
+
+    def test_a_server_that_never_notices_stdin_closed_does_not_hold_the_command(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("FAKE_IGNORE_EOF", "1")
+        started = time.monotonic()
+        found = fetch(SERVER, timeout=30.0)
+        elapsed = time.monotonic() - started
+        # The budget is 30s. Finishing on a 30s deadline would mean the teardown
+        # still spends the protocol timeout waiting on a process that has nothing
+        # left to say.
+        assert elapsed < 10.0, f"teardown spent {elapsed:.1f}s"
+        assert found.server_name == "fake"
+
+    def test_a_server_that_ignores_sigterm_is_still_reaped(self) -> None:
+        """Escalation has to reach SIGKILL.
+
+        Close, then SIGTERM, then SIGKILL. A server that traps SIGTERM and keeps
+        running would otherwise outlive the command inspecting it, holding a
+        pipe and a slot in the process table for as long as it liked.
+        """
+        stub = (
+            "import signal, sys, time\n"
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+            "sys.stdin.read()\n"
+            "while True: time.sleep(0.05)\n"
+        )
+        server = _Server(argv=[sys.executable, "-c", stub], timeout=30.0)
+        server.__enter__()
+        assert server._process is not None
+        pid = server._process.pid
+        server.__exit__(None, None, None)
+        with pytest.raises(ProcessLookupError):
+            os.kill(pid, 0)
+
+    def test_the_teardown_grace_is_short_and_not_the_protocol_budget(self) -> None:
+        # A regression guard on the constant itself: the whole bug was one field
+        # pointing at the wrong number, and no behavioural test should be the only
+        # thing standing between that and a 30-second stall.
+        assert _Server.TEARDOWN_GRACE < 5.0
+
+
+class TestTheTimeoutIsOneBudget:
+    """`--timeout` bounds the whole exchange, not each request."""
+
+    def test_a_server_that_answers_each_call_slowly_still_runs_out_once(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Two replies are needed (initialize, tools/list) and each takes 1.6s.
+        # Budgeted per request, each of the two would land inside its own 2.0s
+        # and the discovery would succeed after 3.2s. Budgeted once for the
+        # exchange, the second reply misses at 2.0s. So the assertion that
+        # separates the two designs is that this raises at all -- the elapsed
+        # bound only rules out waiting forever, and has to allow for the teardown
+        # grace on top of the budget.
+        monkeypatch.setenv("FAKE_REPLY_DELAY", "1.6")
+        started = time.monotonic()
+        with pytest.raises(DiscoveryError, match="did not answer within"):
+            fetch(SERVER, timeout=2.0)
+        elapsed = time.monotonic() - started
+        assert elapsed < 2.0 + _Server.TEARDOWN_GRACE + 1.0, f"took {elapsed:.2f}s"
+
+    def test_a_fast_server_is_unaffected_by_the_shared_budget(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("FAKE_REPLY_DELAY", "0.05")
+        found = fetch(SERVER, timeout=5.0)
+        assert found.server_name == "fake"
+        assert found.tools

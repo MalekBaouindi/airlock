@@ -143,6 +143,39 @@ class _Server:
     _process: subprocess.Popen[bytes] | None = field(default=None, repr=False)
     _buffer: bytearray = field(default_factory=bytearray, repr=False)
     _lines: int = field(default=0, repr=False)
+    _deadline: float | None = field(default=None, repr=False)
+
+    #: How long a server gets to notice its stdin closed.
+    #:
+    #: Deliberately not `timeout`. That budget is for waiting on an *answer*; a
+    #: process that has already answered every question cannot need the same
+    #: number of seconds again to notice EOF. Using it for teardown meant a server
+    #: that stops reading stdin -- which several real ones do once their response
+    #: is written -- held `airlock discover` for the full 30s after the last line
+    #: of useful output. It looked exactly like a protocol timeout.
+    TEARDOWN_GRACE = 2.0
+
+    def _reap(self, process: subprocess.Popen[bytes], grace: float) -> bool:
+        """Wait briefly for exit. True if it went, False if it is still there."""
+        if process.poll() is not None:
+            return True
+        try:
+            process.wait(timeout=grace)
+        except subprocess.TimeoutExpired:
+            return False
+        return True
+
+    def _remaining(self) -> float:
+        """Seconds left in the whole-discovery budget.
+
+        One deadline for the entire exchange, not one per line. Restarting it per
+        line let a server that answered every single request just inside the
+        limit hold the command for `timeout` multiplied by the number of requests,
+        which is not a bound anybody asked for.
+        """
+        if self._deadline is None:
+            self._deadline = time.monotonic() + self.timeout
+        return self._deadline - time.monotonic()
 
     def __enter__(self) -> _Server:
         try:
@@ -167,13 +200,20 @@ class _Server:
             # table is what still needs cleaning up, not the stream.
             with suppress(OSError):
                 process.stdin.close()
-        try:
-            process.wait(timeout=self.timeout)
-        except subprocess.TimeoutExpired:
-            # A server that will not exit on a closed stdin gets killed. Leaving it
-            # running would outlive the command that was inspecting it.
+        # Closing stdin is the polite signal, SIGTERM the next one, SIGKILL the
+        # last. A server blocked reading stdin exits on the first; one that has
+        # stopped reading exits on none of them. Leaving it running would outlive
+        # the command that was inspecting it.
+        if self._reap(process, self.TEARDOWN_GRACE):
+            return
+        with suppress(OSError):
+            process.terminate()
+        if self._reap(process, self.TEARDOWN_GRACE):
+            return
+        with suppress(OSError):
             process.kill()
-            process.wait(timeout=self.timeout)
+        with suppress(subprocess.TimeoutExpired):
+            process.wait(timeout=self.TEARDOWN_GRACE)
 
     def send(self, payload: dict[str, Any]) -> None:
         assert self._process is not None and self._process.stdin is not None
@@ -190,20 +230,20 @@ class _Server:
         wait out a full timeout on a response it is holding in memory. Checking the
         buffer first removes the possibility rather than relying on timing.
 
-        The deadline is also carried across reads instead of restarting per read, so
-        a server dribbling a line out one byte at a time gets one timeout in total
-        rather than an unbounded hold on the command.
+        The deadline is shared across the whole exchange rather than restarted per
+        line or per request, so a server dribbling bytes out one at a time -- or
+        answering every request just inside the limit -- still gets one timeout in
+        total rather than an unbounded hold on the command.
         """
         assert self._process is not None and self._process.stdout is not None
         fd = self._process.stdout.fileno()
-        deadline = time.monotonic() + self.timeout
         while True:
             if b"\n" in self._buffer:
                 line, _, rest = self._buffer.partition(b"\n")
                 self._buffer = bytearray(rest)
                 self._lines += 1
                 return bytes(line) + b"\n"
-            remaining = deadline - time.monotonic()
+            remaining = self._remaining()
             if remaining <= 0:
                 raise DiscoveryError(self._timeout_report())
             ready, _, _ = select.select([fd], [], [], remaining)

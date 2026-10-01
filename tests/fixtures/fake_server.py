@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import time
 
 PROTOCOL_VERSION = "2025-06-18"
 
@@ -83,6 +84,11 @@ def _tools_page(message):
     FAKE_TOOLS_PAGES=1     splits the tool list across two pages.
     FAKE_TOOLS_CURSOR=<c> always returns the same cursor, to exercise loop detection.
     FAKE_TOOLS_NO_LIST=1   refuses tools/list the way some servers do.
+    FAKE_IGNORE_EOF=1      answers everything, then stops reading stdin and never
+                           exits -- the shape several real servers have, and the
+                           one that used to hold `discover` for the full timeout.
+    FAKE_REPLY_DELAY=<s>   waits <s> seconds before each reply, to show whether the
+                           timeout is one budget for the exchange or one per call.
     """
     if os.environ.get("FAKE_TOOLS_NO_LIST") == "1":
         reply_error(message.get("id"), "Method not found", -32601)
@@ -129,6 +135,10 @@ def main() -> int:
         method = message.get("method")
         message_id = message.get("id")
 
+        delay = os.environ.get("FAKE_REPLY_DELAY")
+        if delay:
+            time.sleep(float(delay))
+
         if method == "initialize":
             reply(
                 message_id,
@@ -170,6 +180,13 @@ def main() -> int:
                 + "\n"
             )
             sys.stdout.flush()
+
+    if os.environ.get("FAKE_IGNORE_EOF") == "1":
+        # Stop watching stdin entirely. A real server that has finished
+        # responding does not necessarily keep polling its input, so closing
+        # our end is not a signal it will act on -- it has to be killed.
+        while True:
+            time.sleep(0.05)
 
     return 0
 

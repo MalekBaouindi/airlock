@@ -373,7 +373,10 @@ def cmd_discover(argv: Sequence[str]) -> int:
         "--timeout",
         type=float,
         default=30.0,
-        help="seconds to wait for each answer (default: 30)",
+        help="seconds for the whole discovery, handshake to last tool "
+        "(default: 30). One budget, not one per request: a server that answers "
+        "each call just inside the limit cannot hold the command for 30s times "
+        "the number of calls.",
     )
     parser.add_argument(
         "--conventional-only",

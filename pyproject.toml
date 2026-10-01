@@ -29,6 +29,12 @@ local-llm = [
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.24",
+    # Every test gets a hard ceiling. Two of these tests spawn a real MCP server
+    # and talk to it over a pipe, so a regression in the read deadline makes them
+    # wait rather than fail -- and a suite that hangs in CI reports nothing about
+    # which change caused it. A timeout converts "the run never finished" into a
+    # named failure.
+    "pytest-timeout>=2.3",
     "ruff>=0.6",
     "mypy>=1.11",
     "types-PyYAML",
@@ -63,6 +69,12 @@ warn_unreachable = true
 testpaths = ["tests"]
 asyncio_mode = "auto"
 addopts = "-q"
+# A global ceiling, plus a per-test marker (`@pytest.mark.timeout(n)`) for the
+# handful of tests that legitimately wait on a real MCP server. `thread` rather
+# than `signal` because the slow ones are waiting inside a subprocess pipe, where
+# only another thread can be interrupted.
+timeout = 120
+timeout_method = "thread"
 
 [dependency-groups]
 dev = [
