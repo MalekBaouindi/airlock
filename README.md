@@ -213,7 +213,7 @@ runs it and reads the number. So the question is asked directly:
 $ airlock policy-check --policy examples/corpus-workspace-policy.json
 every destination field the traffic uses is decided by the file (2 of them
 deliberately open; --all to read the notes)
-26 case(s), 48 tool call(s) with a destination, 4 destination field(s) seen
+29 case(s), 51 tool call(s) with a destination, 4 destination field(s) seen
 ```
 
 Delete `http_post.url` from that file and it exits 1, names the field, and says how
@@ -232,6 +232,50 @@ that it is covered.
 
 It found one real gap in the example file it shipped with, on the first run:
 `web_fetch.url`, which is now an explicit `anywhere` with the reasoning above.
+
+### The other direction: every rule needs a caller
+
+`policy-check` asks whether the file decides every field the *traffic* uses. The
+opposite question is whether the traffic exercises every field the *file* decides,
+and nothing asked it. That is the question a false-positive rate lives or dies on:
+0.0% is a claim about the paths the corpus takes, so a surface no benign step ever
+uses has no evidence behind it at all.
+
+It was not true here, in a way that was invisible rather than subtle. Nothing in
+the corpus sent a calendar invitation, used the collector shard, or sent mail. Each
+of those is a surface the policy permits by rule, so a layer refusing exactly them
+measured **0.0% false positives** — the same number as a correct one. Meanwhile a
+crude layer refusing every destination scored 26%, which is why the gap hid behind
+a reassuring number: the test that existed could see gross breakage and not the kind
+an operator would actually ship.
+
+The mail case was the sharpest. That surface's own note argues a policy refusing
+external mail "would break ordinary business and be switched off in a week," and
+the corpus contained no benign mail to hold that claim up.
+
+Three transcripts close it, each ordinary traffic of the kind the rule exists for:
+an internal calendar invitation, a routine batch POST to shard `s3`, and a status
+email to a colleague. The narrow over-blocker went from an invisible 0.0% to a
+caught 12.9%, and the correct layer stayed at 0.0%.
+
+`tests/test_corpus_evidence.py` now enforces the direction. It reads the surfaces
+and allow *entries* out of the policy file and, for each one, builds a layer that
+refuses exactly what that rule permits, then requires the benign corpus to notice.
+Parametrised off the file rather than a hard-coded list, so adding a surface
+without giving it benign traffic fails the build instead of quietly measuring
+clean. Two details it had to get right:
+
+* **The grain is the rule, not the field.** `http_post.url` carries two entries. A
+  corpus with only the `metrics.internal` traffic looks like it covers the field, so
+  deleting the collector-shard transcript broke the shard rule while every
+  per-field check still passed.
+* **Only benign traffic may justify a rule.** `sharded_egress-002` deliberately
+  contains steps that must be allowed — sub-threshold fragments, indistinguishable
+  from ordinary traffic — so a layer refusing the shard scored seven false
+  positives from that attack transcript against one from the benign transcript
+  that actually justifies the rule. Measured over the whole corpus the check
+  passed for the wrong reason and did not pin the transcript at all. An attack
+  transcript is not evidence that an operator would be unaffected.
 
 ### Asking the server instead of guessing
 
@@ -604,10 +648,10 @@ disjoint and each contains steps for every layer this build ships.
 | attack success rate | 0.0% | [0.0%, 0.0%] |
 | weighted ASR | 0.0% | – |
 | detection rate | 100.0% | [100.0%, 100.0%] |
-| false positive rate | 0.0% | 0/33 expected-allow steps |
+| false positive rate | 0.0% | 0/38 expected-allow steps |
 | control noise floor | 1 step | `benign-template-docs`, `template-token` |
 
-16 cases, 47 steps, 8 expected-harm. p50 25.2µs / p95 71.5µs inspection cost per step.
+19 cases, 52 steps, 8 expected-harm. p50 22.4µs / p95 61.0µs inspection cost per step.
 
 **8 of 8 owned steps stopped, 0 false positives, nothing left as coverage debt.** The
 two steps that used to be unserved are the ones a taint tracker cannot see: a
