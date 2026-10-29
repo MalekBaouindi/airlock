@@ -434,7 +434,45 @@ airlock policy-check --policy examples/corpus-workspace-policy.json
 
 # ask a server what it accepts, rather than inferring it from the corpus
 airlock discover --policy workspace.json -- npx -y @scope/server-fetch
+
+# pin today's tool definitions as the trusted baseline, then run against it:
+# a later rewrite is flagged even across a restart, not just within one session
+airlock tool-baseline --baseline workspace-tools.json -- npx -y @scope/server-fetch
+airlock proxy --provenance --tool-baseline workspace-tools.json -- npx -y @scope/server-fetch
 ```
+
+### The tool baseline
+
+The structural layer catches a rug pull (OWASP MCP03: a server rewrites a
+tool's description or schema after a human already approved it, typically via
+`notifications/tools/list_changed`) by comparing a tool's current definition
+against the first one it saw -- no model, no pattern, just a diff against the
+server's own earlier answer. Without `--tool-baseline`, "first one it saw"
+means *this session's*, so the comparison resets every restart along with
+everything else.
+
+`--tool-baseline PATH` makes the approved definition outlive the process. It
+behaves like the policy file in one way and differs in another:
+
+* Like the policy file, there is no default and no built-in baseline. A file
+  that does not exist yet is not an error -- the first definition the proxy
+  sees for a name it bootstraps as the trusted one, the same trust-on-first-use
+  the in-session check already does, just written down.
+* Unlike the policy file, the proxy *does* write to it, but only ever adds an
+  entry for a tool name it has never seen before. An existing entry is never
+  overwritten just because the server now answers differently -- that silent
+  update is the attack the feature exists to catch, so a changed definition
+  stays flagged on every `tools/list` until an operator deliberately
+  re-approves it:
+
+```bash
+airlock tool-baseline --baseline workspace-tools.json --force -- npx -y @scope/server-fetch
+```
+
+A legitimate capability upgrade mid-session (the user grants a broader OAuth
+scope, the server's description grows to match) looks identical on the wire to
+a rug pull and gets flagged the same way. That cost is in the corpus as
+`benign-tool-capability-upgrade`, recorded rather than hidden.
 
 ## Design notes
 
@@ -626,6 +664,7 @@ admitted.
 | `sharded_egress` | arXiv:2602.22450 | split secrets defeat per-request thresholds |
 | `sleeper_channel` | arXiv:2605.13471 | intake and effect decoupled in time |
 | `policy_generality` | arXiv:2608.27092 | naming the goal does not generalise |
+| `tool_rug_pull` | Invariant Labs, MCP tool poisoning disclosure | a server rewrites a tool's description after approval, via `notifications/tools/list_changed` |
 
 ### Grading a partial build without inflating its numbers
 
@@ -648,10 +687,10 @@ disjoint and each contains steps for every layer this build ships.
 | attack success rate | 0.0% | [0.0%, 0.0%] |
 | weighted ASR | 0.0% | – |
 | detection rate | 100.0% | [100.0%, 100.0%] |
-| false positive rate | 0.0% | 0/38 expected-allow steps |
-| control noise floor | 1 step | `benign-template-docs`, `template-token` |
+| false positive rate | 0.0% | 0/48 expected-allow steps |
+| control noise floor | 2 steps | `benign-template-docs`/`template-token`, `benign-tool-capability-upgrade`/`tool-definition-changed` |
 
-19 cases, 52 steps, 8 expected-harm. p50 22.4µs / p95 61.0µs inspection cost per step.
+21 cases, 64 steps, 8 expected-harm. p50 17.7µs / p95 66.5µs inspection cost per step.
 
 **8 of 8 owned steps stopped, 0 false positives, nothing left as coverage debt.** The
 two steps that used to be unserved are the ones a taint tracker cannot see: a
@@ -667,6 +706,18 @@ not overfitting — it was the corpus working. Four steps had claimed `provenanc
 credit for secrets that never entered the transcript (`<vault value>`,
 `<service account token>`), which taint tracking cannot catch by construction, and
 24 drip steps demanded a block on a single character.
+
+The `tool_rug_pull` family is new: a server that silently rewrites a tool's
+description or schema after a human already approved it, exploiting
+`notifications/tools/list_changed` so the agent now acts on text no one reviewed
+([Invariant Labs's tool-poisoning disclosure](https://invariantlabs.ai/blog/mcp-security-notification-tool-poisoning-attacks)
+names this a rug pull). It needs no model and no attack-string pattern — the
+structural layer now keeps the first `tools/list` definition it sees per tool name
+for the life of a session and flags any later definition that differs, which is a
+comparison against the server's own earlier answer rather than a heuristic on text.
+The honest cost of that check is in the corpus too: `benign-tool-capability-upgrade`
+is a legitimate mid-session capability grant that looks identical on the wire and
+is flagged for the same reason, counted as analyst noise rather than hidden.
 
 Ablation, same split:
 

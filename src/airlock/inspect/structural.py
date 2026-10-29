@@ -17,15 +17,21 @@ Detection targets map to OWASP MCP Top 10 (2026):
 
 from __future__ import annotations
 
+import json
 import re
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Literal
 
 from airlock.audit.log import Decision, Finding
 from airlock.gateway.jsonrpc import Message
 from airlock.gateway.session import SessionContext
 from airlock.inspect.base import Verdict
+
+
+class BaselineError(ValueError):
+    """A `--tool-baseline` file exists but could not be read as one."""
 
 Severity = Literal["info", "low", "medium", "high", "critical"]
 SEVERITY_RANK: dict[Severity, int] = {
@@ -133,6 +139,15 @@ _COMMENTED_INSTRUCTION = re.compile(
     r"you must|do not tell|exfiltrat|send (?:it|them|the)))[^>]{0,600}-->",
     re.IGNORECASE | re.DOTALL,
 )
+
+
+def _tool_signature(tool: dict[str, Any]) -> str:
+    """Canonical form of the part of a tool definition a human actually reviews."""
+    return json.dumps(
+        {"description": tool.get("description"), "inputSchema": tool.get("inputSchema")},
+        sort_keys=True,
+        default=str,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -319,16 +334,104 @@ def scan_text(text: str, path: str) -> list[RuleHit]:
 
 
 class StructuralInspector:
-    """Detector that runs structural rules over request params and results."""
+    """Detector that runs structural rules over request params and results.
+
+    Also holds one piece of state: the first ``tools/list`` definition seen for
+    each tool name in this session. A server that silently rewrites a tool's
+    description or schema after a human has already approved it (OWASP calls
+    this a rug pull; MCP's own ``notifications/tools/list_changed`` is the
+    mechanism) is detectable with no model and no corpus of attack strings --
+    the comparison is against the server's own earlier answer, not a pattern.
+    A benign capability upgrade looks identical, so this defaults to `flag`,
+    like every other heuristic here with a legitimate use on the other side.
+    """
 
     name = "structural"
 
-    def __init__(self, *, block_at: Severity | None = "critical") -> None:
+    def __init__(
+        self,
+        *,
+        block_at: Severity | None = "critical",
+        baseline_path: str | Path | None = None,
+    ) -> None:
         # Default: block only on the one class with no legitimate use. Every
         # other severity flags, leaving the decision to policy. Blocking on
         # medium-severity heuristics by default is how security tools acquire
         # the false-positive rate that gets them uninstalled.
         self.block_at = block_at
+        self._known_tools: dict[str, str] = {}
+        # Without a baseline path, a rug pull is only caught within the one
+        # session that saw both the approved and the rewritten definition --
+        # restart the proxy and the comparison starts from nothing. With one,
+        # a definition a human approved outlives the process: it is read at
+        # startup and never silently overwritten by a later, different answer.
+        # Only a definition for a *name this baseline has never seen* gets
+        # written back; a name it already has is pinned, exactly as a rug pull
+        # needs it to be, until an operator re-approves it explicitly (see
+        # `airlock tool-baseline`).
+        self._baseline_path = Path(baseline_path) if baseline_path is not None else None
+        if self._baseline_path is not None and self._baseline_path.exists():
+            self._load_baseline()
+
+    def reset(self) -> None:
+        self._known_tools.clear()
+        if self._baseline_path is not None and self._baseline_path.exists():
+            self._load_baseline()
+
+    def _load_baseline(self) -> None:
+        assert self._baseline_path is not None
+        try:
+            raw = json.loads(self._baseline_path.read_text())
+        except OSError as exc:
+            raise BaselineError(f"cannot read tool baseline {self._baseline_path}: {exc}") from exc
+        except json.JSONDecodeError as exc:
+            raise BaselineError(f"{self._baseline_path} is not valid JSON: {exc}") from exc
+        if not isinstance(raw, dict):
+            raise BaselineError(
+                f"{self._baseline_path}: expected an object mapping tool name to definition"
+            )
+        for name, entry in raw.items():
+            if not isinstance(name, str) or not isinstance(entry, dict):
+                raise BaselineError(
+                    f"{self._baseline_path}: entry {name!r} is not a tool definition object"
+                )
+            self._known_tools[name] = _tool_signature(entry)
+
+    def _remember_new_tool(self, name: str, signature: str) -> list[RuleHit]:
+        """Add a never-before-seen tool to the persisted baseline, if there is one.
+
+        Nothing has been approved to compare this against, so there is nothing
+        to pin yet -- unlike a changed definition, writing it is safe. A write
+        failure must not be swallowed: it means the next restart loses this
+        tool's protection silently, which is exactly the kind of gap this
+        feature exists to close, so it is reported as a finding rather than
+        dropped.
+        """
+        if self._baseline_path is None:
+            return []
+        try:
+            existing: dict[str, Any] = {}
+            if self._baseline_path.exists():
+                parsed = json.loads(self._baseline_path.read_text())
+                if isinstance(parsed, dict):
+                    existing = parsed
+            existing[name] = json.loads(signature)
+            self._baseline_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self._baseline_path.with_name(self._baseline_path.name + ".tmp")
+            tmp.write_text(json.dumps(existing, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            tmp.replace(self._baseline_path)
+        except OSError as exc:
+            return [
+                RuleHit(
+                    rule="tool-baseline-write-failed",
+                    severity="info",
+                    owasp=None,
+                    detail=f"could not persist new tool {name!r} to {self._baseline_path}: {exc}",
+                    path=f"$.tools[name={name!r}]",
+                    excerpt="",
+                )
+            ]
+        return []
 
     def _inspect(self, value: Any) -> tuple[list[Finding], Severity]:
         findings: list[Finding] = []
@@ -353,10 +456,60 @@ class StructuralInspector:
         return self._decision(findings, worst)
 
     def inspect_response(self, message: Message, ctx: SessionContext) -> Verdict:
-        if not message.is_error:
-            findings, worst = self._inspect(message.result)
-            return self._decision(findings, worst)
-        return Verdict.allow()
+        if message.is_error:
+            return Verdict.allow()
+        findings, worst = self._inspect(message.result)
+        if ctx.inbound_method == "tools/list":
+            for hit in self._tool_definition_drift(message.result):
+                findings.append(hit.to_finding())
+                if SEVERITY_RANK[hit.severity] > SEVERITY_RANK[worst]:
+                    worst = hit.severity
+        return self._decision(findings, worst)
+
+    def _tool_definition_drift(self, result: Any) -> list[RuleHit]:
+        if not isinstance(result, dict):
+            return []
+        tools = result.get("tools")
+        if not isinstance(tools, list):
+            return []
+        hits: list[RuleHit] = []
+        for tool in tools:
+            if not isinstance(tool, dict):
+                continue
+            name = tool.get("name")
+            if not isinstance(name, str):
+                continue
+            signature = _tool_signature(tool)
+            previous = self._known_tools.get(name)
+            if previous is None:
+                # Nothing approved this name yet, in this session or on disk.
+                # Record it as the trusted definition going forward.
+                self._known_tools[name] = signature
+                hits.extend(self._remember_new_tool(name, signature))
+                continue
+            if previous != signature:
+                hits.append(
+                    RuleHit(
+                        rule="tool-definition-changed",
+                        severity="high",
+                        owasp="MCP03",
+                        detail=(
+                            f"tool {name!r} description or input schema differs from "
+                            "the one already approved; not pinned to the new value -- "
+                            "re-run `airlock tool-baseline` to approve it"
+                            if self._baseline_path is not None
+                            else f"tool {name!r} description or input schema differs from "
+                            "the one first presented in this session"
+                        ),
+                        path=f"$.tools[name={name!r}]",
+                        excerpt=_excerpt(str(tool.get("description") or ""), 0),
+                    )
+                )
+                # Deliberately not written back to `_known_tools` or disk: a
+                # changed definition stays flagged on every subsequent
+                # tools/list too, rather than being silently adopted as the
+                # new normal the second time it is seen.
+        return hits
 
     def _decision(self, findings: Sequence[Finding], worst: Severity) -> Verdict:
         if not findings:

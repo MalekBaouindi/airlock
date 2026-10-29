@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import os
 import sys
 from collections.abc import Sequence
@@ -25,7 +26,7 @@ from airlock.gateway.stdio_proxy import StdioProxy, UpstreamSpec
 from airlock.inspect.base import Inspector, InspectorPipeline
 from airlock.inspect.policy import Policy, PolicyError, PolicyInspector
 from airlock.inspect.semantic import SemanticInspector
-from airlock.inspect.structural import SEVERITY_RANK, Severity, StructuralInspector
+from airlock.inspect.structural import SEVERITY_RANK, BaselineError, Severity, StructuralInspector
 from airlock.llm.client import LocalModel
 from airlock.provenance.inspector import ProvenanceInspector
 
@@ -117,6 +118,7 @@ def build_proxy_layers(
     semantic: bool,
     policy: Policy | None,
     judge_endpoint: str | None = None,
+    tool_baseline: Path | None = None,
 ) -> list[Inspector]:
     """The layers a proxy invocation runs, in the order it applies them.
 
@@ -145,7 +147,7 @@ def build_proxy_layers(
             raise ValueError(
                 f"unknown severity {block_at!r}; expected one of {tuple(SEVERITY_RANK)}"
             )
-        inspectors.append(StructuralInspector(block_at=level))
+        inspectors.append(StructuralInspector(block_at=level, baseline_path=tool_baseline))
     if provenance:
         inspectors.append(ProvenanceInspector())
     if policy is not None:
@@ -223,6 +225,18 @@ def build_proxy_parser() -> argparse.ArgumentParser:
         help="where the local model is served (default: $AIRLOCK_JUDGE_ENDPOINT)",
     )
     parser.add_argument(
+        "--tool-baseline",
+        type=Path,
+        default=None,
+        help=(
+            "file pinning each tool's approved description/schema (default: "
+            "$AIRLOCK_TOOL_BASELINE). Without one, a rewritten tool definition "
+            "is only caught within the session that saw both versions; with "
+            "one, it survives a restart. Seed or re-approve it with "
+            "`airlock tool-baseline`"
+        ),
+    )
+    parser.add_argument(
         "upstream",
         nargs=argparse.REMAINDER,
         help="-- followed by the upstream server command and its arguments",
@@ -250,6 +264,7 @@ def cmd_proxy(argv: Sequence[str]) -> int:
     args = build_proxy_parser().parse_args(our_args)
 
     policy = _load_policy(str(args.policy) if args.policy else None)
+    tool_baseline = args.tool_baseline or os.environ.get("AIRLOCK_TOOL_BASELINE")
     try:
         inspectors = build_proxy_layers(
             no_structural=args.no_structural,
@@ -258,6 +273,7 @@ def cmd_proxy(argv: Sequence[str]) -> int:
             semantic=args.semantic,
             policy=policy,
             judge_endpoint=args.judge_endpoint,
+            tool_baseline=Path(tool_baseline) if tool_baseline else None,
         )
     except JudgeUnavailable as exc:
         print(
@@ -265,6 +281,9 @@ def cmd_proxy(argv: Sequence[str]) -> int:
             "is not answering. Start it, or pass --judge-endpoint.",
             file=sys.stderr,
         )
+        return 2
+    except BaselineError as exc:
+        print(f"error: {exc}", file=sys.stderr)
         return 2
 
     pipeline = InspectorPipeline(inspectors=inspectors)
@@ -425,6 +444,81 @@ def cmd_discover(argv: Sequence[str]) -> int:
             f"rest are listed because an ordinary name can still point somewhere."
         )
     return 1 if conventional else 0
+
+
+def cmd_tool_baseline(argv: Sequence[str]) -> int:
+    """Capture or re-approve the tool definitions `--tool-baseline` pins.
+
+    This is the explicit, human half of the rug-pull check: the proxy only
+    ever *adds* a never-before-seen tool to the baseline file on its own, and
+    never overwrites an existing entry just because the server now answers
+    differently -- that silent update is the attack. Replacing an entry is an
+    operator decision, made here, against a server the operator chose to run,
+    the same posture `airlock discover` takes for policy coverage.
+    """
+    parser = argparse.ArgumentParser(
+        prog="airlock tool-baseline",
+        description="Capture a live server's tool definitions as the trusted baseline.",
+    )
+    parser.add_argument(
+        "--baseline",
+        type=Path,
+        required=True,
+        help="file to write (the same path passed to `airlock proxy --tool-baseline`)",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="overwrite an existing baseline file (re-approve every tool it covers)",
+    )
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=30.0,
+        help="seconds for the whole discovery (default: 30)",
+    )
+    parser.add_argument(
+        "server",
+        nargs=argparse.REMAINDER,
+        help="the server to run, after -- (e.g. airlock tool-baseline --baseline b.json -- npx ...)",
+    )
+    args = parser.parse_args(list(argv))
+
+    command = [part for part in args.server if part != "--"]
+    if not command:
+        print(
+            "error: no server command; put it after --\n"
+            "       airlock tool-baseline --baseline b.json -- npx -y @scope/server",
+            file=sys.stderr,
+        )
+        return 2
+    if args.baseline.exists() and not args.force:
+        print(
+            f"error: {args.baseline} already exists; pass --force to re-approve every "
+            "tool it covers (this is the moment a changed definition stops being flagged)",
+            file=sys.stderr,
+        )
+        return 2
+
+    from airlock.discover import DiscoveryError, fetch
+
+    try:
+        discovery = fetch(command, timeout=args.timeout)
+    except DiscoveryError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    baseline = {
+        tool.name: {
+            "description": tool.raw.get("description"),
+            "inputSchema": tool.raw.get("inputSchema"),
+        }
+        for tool in discovery.tools
+    }
+    args.baseline.parent.mkdir(parents=True, exist_ok=True)
+    args.baseline.write_text(json.dumps(baseline, indent=2, sort_keys=True) + "\n")
+    print(f"wrote {len(baseline)} tool definition(s) to {args.baseline}")
+    return 0
 
 
 def cmd_policy_check(argv: Sequence[str]) -> int:
@@ -841,6 +935,7 @@ usage:
   airlock eval   [options]                          score against the corpus
   airlock policy-check [options]                    fields the policy file does not decide
   airlock discover  [options] -- <command>          what a live server accepts
+  airlock tool-baseline --baseline b.json -- <command>   pin tool definitions as trusted
 
 examples:
   airlock proxy -- npx -y @modelcontextprotocol/server-filesystem /tmp
@@ -849,6 +944,8 @@ examples:
   airlock eval --split test --ablation --json results/eval.json
   airlock policy-check --policy examples/corpus-workspace-policy.json
   airlock discover --policy p.json -- npx -y @modelcontextprotocol/server-filesystem /tmp
+  airlock tool-baseline --baseline b.json -- npx -y @modelcontextprotocol/server-filesystem /tmp
+  airlock proxy --tool-baseline b.json -- npx -y @modelcontextprotocol/server-filesystem /tmp
 
 run 'airlock <command> --help' for command options.
 """
@@ -871,6 +968,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "eval": cmd_eval,
         "discover": cmd_discover,
         "policy-check": cmd_policy_check,
+        "tool-baseline": cmd_tool_baseline,
     }
     handler = handlers.get(command)
     if handler is None:

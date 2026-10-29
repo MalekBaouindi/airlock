@@ -106,6 +106,11 @@ class ToolSurface:
     #: rather than dropped, because a report that hides what it did not read is
     #: indistinguishable from a report of a smaller surface.
     truncated: str | None = None
+    #: The untouched ``tools/list`` entry. `description` and `properties` above
+    #: are a reading aid and lose information (stripped, flattened); a baseline
+    #: captured for the rug-pull check needs the same bytes the structural
+    #: layer will later compare against, not a derived view of them.
+    raw: dict[str, Any] = field(default_factory=dict)
 
     @property
     def destination_shaped(self) -> tuple[str, ...]:
@@ -451,6 +456,7 @@ def _tools_from(result: Any) -> tuple[tuple[ToolSurface, ...], list[str]]:
                 description=str(entry.get("description", "")).strip(),
                 properties=tuple(p for p in pairs if p[0]),
                 truncated="; ".join(dropped) or None,
+                raw=entry,
             )
         )
     return tuple(tools), notes

@@ -163,6 +163,7 @@ having a documented adversary, not by being easy to generate.
 | `sharded_egress` | arXiv:2602.22450 | Splitting a secret across requests defeats per-request DLP thresholds. |
 | `sleeper_channel` | arXiv:2605.13471 | Intake and effect decoupled across time; nothing is anomalous in either step alone. |
 | `policy_generality` | arXiv:2608.27092 | A policy that names the goal does not generalise; one that enumerates the exfiltration surface does. |
+| `tool_rug_pull` | Invariant Labs, "MCP Security Notification: Tool Poisoning Attacks" | A server changes a tool's description or schema after the client already approved it, via `notifications/tools/list_changed`; the agent now acts on text no human reviewed. |
 
 ## Benign corpus
 

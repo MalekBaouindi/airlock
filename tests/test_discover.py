@@ -20,6 +20,8 @@ from airlock.discover import (
     looks_destination_shaped,
     report,
 )
+from airlock.gateway.jsonrpc import Message
+from airlock.gateway.session import SessionContext
 from airlock.inspect.policy import RECIPIENT_ARGUMENTS, Policy, Surface
 
 FAKE = str(Path(__file__).resolve().parent / "fixtures" / "fake_server.py")
@@ -202,6 +204,65 @@ class TestCommand:
         # Discovery is a reading aid. It must not become a way to change a verdict.
         monkeypatch.setenv("FAKE_TOOLS_EXTRA", "1")
         assert main(["discover", "--", *SERVER]) == 0
+
+
+class TestToolBaselineCommand:
+    """`airlock tool-baseline` captures what the structural layer's rug-pull
+    check will later compare against -- the raw `tools/list` answer, not the
+    flattened reading-aid view `discover` prints."""
+
+    def test_no_server_command_is_an_error(self, capsys: pytest.CaptureFixture[str]) -> None:
+        assert main(["tool-baseline", "--baseline", "b.json", "--"]) == 2
+        assert "no server command" in capsys.readouterr().err
+
+    def test_writes_the_raw_definition_for_every_tool(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.setenv("FAKE_TOOLS_EXTRA", "1")
+        baseline = tmp_path / "baseline.json"
+        assert main(["tool-baseline", "--baseline", str(baseline), "--", *SERVER]) == 0
+        written = json.loads(baseline.read_text())
+        assert {"sync_artifact", "read_file"} <= written.keys()
+        assert written["read_file"]["description"]
+        assert written["read_file"]["inputSchema"]["type"] == "object"
+
+    def test_refuses_to_overwrite_without_force(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        baseline = tmp_path / "baseline.json"
+        assert main(["tool-baseline", "--baseline", str(baseline), "--", *SERVER]) == 0
+        assert main(["tool-baseline", "--baseline", str(baseline), "--", *SERVER]) == 2
+        assert "--force" in capsys.readouterr().err
+
+    def test_force_re_approves(self, tmp_path: Path) -> None:
+        baseline = tmp_path / "baseline.json"
+        assert main(["tool-baseline", "--baseline", str(baseline), "--", *SERVER]) == 0
+        assert main(["tool-baseline", "--baseline", str(baseline), "--force", "--", *SERVER]) == 0
+
+    def test_a_baseline_captured_here_is_what_the_proxy_pins(self, tmp_path: Path) -> None:
+        """The two commands have to agree on the file's shape, or pinning a
+        baseline and then starting the proxy against it is a format mismatch
+        waiting to surprise an operator."""
+        from airlock.inspect.structural import StructuralInspector
+
+        baseline = tmp_path / "baseline.json"
+        assert main(["tool-baseline", "--baseline", str(baseline), "--", *SERVER]) == 0
+
+        inspector = StructuralInspector(baseline_path=baseline)
+        ctx = SessionContext()
+        ctx.inbound_method = "tools/list"
+        # A second, identical sighting of what was just captured must not flag.
+        discovery = fetch(SERVER, timeout=15.0)
+        message = Message.parse(
+            json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": {"tools": [tool.raw for tool in discovery.tools]},
+                }
+            )
+        )
+        assert inspector.inspect_response(message, ctx).action == "allow"
 
 
 def test_fake_server_env_is_not_leaked_between_runs() -> None:
